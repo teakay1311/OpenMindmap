@@ -1,0 +1,280 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openmindmap.local/docs/project-format-v3.schema.json",
+  "title": "OpenMindmap Project Format V3 (schema_version 3)",
+  "description": "Sơ đồ JSON native duy nhất của MindMap App V3.5 — theo SRS 18.1–18.4. Trường null/absent mang nghĩa kế thừa; không dùng null cho id/role/order/text.",
+  "type": "object",
+  "required": ["schema_version", "project_id", "name", "created_at", "updated_at", "document_revision", "central_topic_id", "topics", "crosslinks", "drawings", "assets", "layout", "theme_id", "map_style_overrides", "role_style_defaults"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 3 },
+    "project_id": { "$ref": "#/$defs/uuid" },
+    "name": { "type": "string", "minLength": 1 },
+    "created_at": { "$ref": "#/$defs/isoDateTime" },
+    "updated_at": { "$ref": "#/$defs/isoDateTime" },
+    "document_revision": { "type": "integer", "minimum": 1 },
+    "central_topic_id": { "$ref": "#/$defs/uuid" },
+    "version_note": { "type": ["string", "null"] },
+    "topics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/topic" },
+      "description": "Đúng MỘT topic có role=central (LOCK-01); hierarchy acyclic; parent_id phải trỏ tới topic tồn tại."
+    },
+    "crosslinks": { "type": "array", "items": { "$ref": "#/$defs/crosslink" } },
+    "drawings": { "type": "array", "items": { "$ref": "#/$defs/drawing" } },
+    "assets": { "type": "array", "items": { "$ref": "#/$defs/asset" } },
+    "layout": { "$ref": "#/$defs/layout" },
+    "theme_id": { "enum": ["modern-blue", "colorful", "soft", "monochrome", "dark-map", "warm", "nature", "minimal"] },
+    "map_style_overrides": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "text": { "$ref": "#/$defs/textStyle" },
+        "box_style": { "$ref": "#/$defs/boxStyle" }
+      }
+    },
+    "role_style_defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "central": { "$ref": "#/$defs/roleDefault" },
+        "normal": { "$ref": "#/$defs/roleDefault" },
+        "floating": { "$ref": "#/$defs/roleDefault" }
+      }
+    }
+  },
+  "$defs": {
+    "uuid": { "type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" },
+    "isoDateTime": { "type": "string", "format": "date-time" },
+    "isoDate": { "type": ["string", "null"], "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+    "hexColor": { "type": ["string", "null"], "pattern": "^#([0-9a-fA-F]{6}|[0-9a-fA-F]{8})$" },
+    "roleDefault": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "text": { "$ref": "#/$defs/textStyle" }, "box_style": { "$ref": "#/$defs/boxStyle" } }
+    },
+    "topic": {
+      "type": "object",
+      "required": ["id", "role", "parent_id", "order", "text", "collapsed", "branch_side", "style"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/uuid" },
+        "role": { "enum": ["central", "normal", "floating"] },
+        "parent_id": { "type": ["string", "null"], "description": "null chỉ hợp lệ cho central/floating root" },
+        "order": { "type": "integer", "minimum": 0 },
+        "text": { "type": "string", "description": "Plain Unicode; định dạng áp toàn node, không rich-text span (V35-002)" },
+        "notes": { "type": ["string", "null"], "description": "Markdown cơ bản" },
+        "collapsed": { "type": "boolean" },
+        "manual_position": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["x", "y"],
+          "properties": { "x": { "type": "number" }, "y": { "type": "number" } },
+          "description": "Top-left trong world unit; chỉ free-form dùng"
+        },
+        "branch_side": { "enum": ["auto", "left", "right"] },
+        "branch_color_seed": { "type": ["integer", "null"], "minimum": 0, "maximum": 255, "description": "Seed ổn định 0..255 — màu nhánh theo ID, không đổi khi reorder (16.4)" },
+        "style": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "text": { "$ref": "#/$defs/textStyle" },
+            "box_style": { "$ref": "#/$defs/boxStyle" },
+            "hierarchy_edge": { "$ref": "#/$defs/edgeStyle" }
+          }
+        },
+        "branch_style_override": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "CHỈ các field kế thừa được xuống descendants (18.2)",
+              "properties": {
+                "text_color": { "$ref": "#/$defs/hexColor" },
+                "font_family": { "type": ["string", "null"] },
+                "font_size_pt": { "type": ["number", "null"], "minimum": 6, "maximum": 96 },
+                "edge_color": { "$ref": "#/$defs/hexColor" },
+                "edge_width_world": { "type": ["number", "null"], "minimum": 0.5, "maximum": 12 },
+                "edge_routing": { "type": ["string", "null"], "enum": ["curved", "straight", "elbow", null] },
+                "accent_color": { "$ref": "#/$defs/hexColor" }
+              }
+            }
+          ]
+        },
+        "image": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["asset_id", "fit", "placement", "width_fraction"],
+              "properties": {
+                "asset_id": { "type": "string" },
+                "fit": { "enum": ["contain", "cover"] },
+                "placement": { "enum": ["above", "below", "left", "right"] },
+                "width_fraction": { "type": "number", "minimum": 0.05, "maximum": 1 }
+              }
+            }
+          ]
+        },
+        "icon": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["icon_id", "size", "position"],
+              "properties": {
+                "icon_id": { "type": "string", "description": "ID icon vector nội bộ (lib/scene/icons.ts)" },
+                "size": { "enum": ["s", "m", "l"] },
+                "position": { "enum": ["before_title", "corner"] }
+              }
+            }
+          ]
+        },
+        "checkbox": { "type": ["boolean", "null"] },
+        "url": { "type": ["string", "null"], "pattern": "^(https?://|mailto:)" },
+        "date": { "$ref": "#/$defs/isoDate" },
+        "numbering": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["format", "apply_to_subtree"],
+              "properties": {
+                "format": { "enum": ["none", "decimal", "dotted", "alpha"] },
+                "apply_to_subtree": { "type": "boolean" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "textStyle": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Mọi field optional — omit = kế thừa",
+      "properties": {
+        "font_family": { "type": ["string", "null"] },
+        "font_size_pt": { "type": ["number", "null"], "minimum": 6, "maximum": 96 },
+        "font_weight": { "type": ["integer", "null"], "enum": [400, 500, 600, 700, null] },
+        "italic": { "type": ["boolean", "null"] },
+        "underline": { "type": ["boolean", "null"] },
+        "strike": { "type": ["boolean", "null"] },
+        "color": { "$ref": "#/$defs/hexColor" },
+        "horizontal_align": { "type": ["string", "null"], "enum": ["left", "center", "right", null] },
+        "vertical_align": { "type": ["string", "null"], "enum": ["top", "middle", "bottom", null] },
+        "line_height_multiplier": { "type": ["number", "null"], "minimum": 1, "maximum": 2 },
+        "paragraph_gap_world": { "type": ["number", "null"], "minimum": 0, "maximum": 32 },
+        "wrap": { "type": ["boolean", "null"] },
+        "wrap_width_world": { "type": ["number", "null"], "minimum": 80, "maximum": 800 },
+        "padding_world": {
+          "type": ["array", "null"],
+          "items": { "type": "number", "minimum": 0, "maximum": 64 },
+          "minItems": 4,
+          "maxItems": 4,
+          "description": "[top, right, bottom, left] world units; mặc định [10,14,10,14]"
+        }
+      }
+    },
+    "boxStyle": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "shape": { "type": ["string", "null"], "enum": ["rect", "rounded", "pill", null] },
+        "size_mode": { "type": ["string", "null"], "enum": ["auto", "fixed", null] },
+        "width_world": { "type": ["number", "null"], "minimum": 32, "maximum": 1200 },
+        "height_world": { "type": ["number", "null"], "minimum": 24, "maximum": 800 },
+        "min_width_world": { "type": ["number", "null"], "minimum": 0 },
+        "min_height_world": { "type": ["number", "null"], "minimum": 0 },
+        "corner_radius_world": { "type": ["number", "null"], "minimum": 0, "maximum": 32 },
+        "fill": { "$ref": "#/$defs/hexColor" },
+        "stroke": { "$ref": "#/$defs/hexColor" },
+        "stroke_width_world": { "type": ["number", "null"], "minimum": 0, "maximum": 12 },
+        "stroke_dash": { "type": ["string", "null"], "enum": ["solid", "dashed", "dotted", null] },
+        "shadow_preset": { "type": ["string", "null"], "enum": ["none", "soft", null] }
+      }
+    },
+    "edgeStyle": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "routing": { "type": ["string", "null"], "enum": ["curved", "straight", "elbow", null] },
+        "color": { "$ref": "#/$defs/hexColor" },
+        "width_world": { "type": ["number", "null"], "minimum": 0.5, "maximum": 12 },
+        "dash": { "type": ["string", "null"], "enum": ["solid", "dashed", "dotted", null] }
+      }
+    },
+    "layout": {
+      "type": "object",
+      "required": ["kind", "direction", "node_gap", "branch_gap", "level_gap", "root_island_gap", "routing", "sort_policy", "chronological", "start_angle_deg", "snap_to_grid"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["balanced", "logic", "tree", "organization", "radial", "fishbone", "timeline", "freeform"] },
+        "direction": { "enum": ["both", "left", "right", "top", "bottom", "cw", "ccw"] },
+        "node_gap": { "type": "number", "minimum": 4 },
+        "branch_gap": { "type": "number", "minimum": 8 },
+        "level_gap": { "type": "number", "minimum": 30 },
+        "root_island_gap": { "type": "number", "minimum": 40 },
+        "routing": { "enum": ["curved", "straight", "elbow"] },
+        "sort_policy": { "enum": ["user_order", "by_date"] },
+        "chronological": { "type": "boolean" },
+        "start_angle_deg": { "type": "number" },
+        "snap_to_grid": { "type": "boolean" }
+      }
+    },
+    "crosslink": {
+      "type": "object",
+      "required": ["id", "source", "target"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "source": { "$ref": "#/$defs/uuid" },
+        "target": { "$ref": "#/$defs/uuid" },
+        "label": { "type": ["string", "null"] },
+        "color": { "$ref": "#/$defs/hexColor" },
+        "width_world": { "type": ["number", "null"], "minimum": 0.5, "maximum": 12 },
+        "dash": { "type": ["string", "null"], "enum": ["solid", "dashed", "dotted", null] },
+        "arrow_start": { "type": "boolean" },
+        "arrow_end": { "type": "boolean" },
+        "waypoints": { "type": ["array", "null"], "items": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } } } }
+      },
+      "description": "source ≠ target; hai đầu phải là topic tồn tại; không đụng hierarchy (10.1)"
+    },
+    "drawing": {
+      "type": "object",
+      "required": ["id", "kind", "points", "color", "width_world", "opacity", "layer_order"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "kind": { "enum": ["pen", "highlighter", "line", "rect", "ellipse"] },
+        "points": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "type": "object", "additionalProperties": false, "required": ["x", "y"], "properties": { "x": { "type": "number" }, "y": { "type": "number" } } },
+          "description": "pen/highlighter: polyline; line: [p1,p2]; rect/ellipse: [corner1, corner2] — world-space độc lập layout (LOCK-07)"
+        },
+        "color": { "type": "string" },
+        "width_world": { "type": "number", "minimum": 0.5, "maximum": 60 },
+        "opacity": { "type": "number", "minimum": 0.05, "maximum": 1 },
+        "fill": { "type": ["string", "null"] },
+        "layer_order": { "type": "integer" }
+      }
+    },
+    "asset": {
+      "type": "object",
+      "required": ["id", "mime", "width", "height", "hash", "data_url"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "mime": { "enum": ["image/png", "image/jpeg", "image/webp"] },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "hash": { "type": "string", "description": "Fingerprint dedupe (size-dims)" },
+        "data_url": { "type": "string", "pattern": "^data:image/(png|jpeg|webp);base64,", "description": "Nhúng base64 — không path ngoài (14.6.5)" }
+      }
+    }
+  }
+}
