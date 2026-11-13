@@ -2,6 +2,14 @@
 
 OpenMindmap là ứng dụng mind map chạy cục bộ trên macOS và trình duyệt.
 
+<p align="center">
+  <img src="public/openmindmap-logo-v4.png" alt="Logo OpenMindmap" width="180">
+</p>
+
+## Xem trước giao diện
+
+![Giao diện OpenMindmap](docs/images/openmindmap-preview.png)
+
 ## Tải bản cài macOS
 
 **Apple Silicon (arm64), phiên bản 0.2.1**
