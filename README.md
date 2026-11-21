@@ -12,13 +12,13 @@ OpenMindmap là ứng dụng mind map chạy cục bộ trên macOS và trình d
 
 ## Tải bản cài macOS
 
-**Apple Silicon (arm64), phiên bản 0.2.1**
+**Apple Silicon (arm64), phiên bản 0.2.2**
 
-- [Tải OpenMindmap-0.2.1-arm64.dmg](https://github.com/teakay1311/OpenMindmap/releases/download/v0.2.1/OpenMindmap-0.2.1-arm64.dmg)
-- [Tải checksum SHA-256](https://github.com/teakay1311/OpenMindmap/releases/download/v0.2.1/OpenMindmap-0.2.1-arm64.dmg.sha256)
-- [Xem ghi chú phát hành](https://github.com/teakay1311/OpenMindmap/releases/tag/v0.2.1)
+- [Tải OpenMindmap-0.2.2-arm64.dmg](https://github.com/teakay1311/OpenMindmap/releases/download/v0.2.2/OpenMindmap-0.2.2-arm64.dmg)
+- [Tải checksum SHA-256](https://github.com/teakay1311/OpenMindmap/releases/download/v0.2.2/OpenMindmap-0.2.2-arm64.dmg.sha256)
+- [Xem ghi chú phát hành](https://github.com/teakay1311/OpenMindmap/releases/tag/v0.2.2)
 
-Yêu cầu hệ thống được khai báo là macOS 13.5 trở lên và máy Mac Apple Silicon. Bản cài 0.2.1 được ký ad hoc, chưa được notarize bởi Apple. macOS có thể hiện cảnh báo khi mở lần đầu. Chỉ mở bản tải từ Release chính thức sau khi kiểm tra checksum. Xem [hướng dẫn của Apple về mở ứng dụng tải từ Internet](https://support.apple.com/en-us/102445).
+Yêu cầu hệ thống được khai báo là macOS 13.5 trở lên và máy Mac Apple Silicon. Bản cài 0.2.2 được ký ad hoc, chưa được notarize bởi Apple. macOS có thể hiện cảnh báo khi mở lần đầu. Chỉ mở bản tải từ Release chính thức sau khi kiểm tra checksum. Xem [hướng dẫn của Apple về mở ứng dụng tải từ Internet](https://support.apple.com/en-us/102445).
 
 ### Cài đặt
 
@@ -29,7 +29,7 @@ Yêu cầu hệ thống được khai báo là macOS 13.5 trở lên và máy Ma
 Đối chiếu checksum trong cùng thư mục tải về:
 
 ~~~sh
-shasum -a 256 -c OpenMindmap-0.2.1-arm64.dmg.sha256
+shasum -a 256 -c OpenMindmap-0.2.2-arm64.dmg.sha256
 ~~~
 
 Checksum xác nhận tệp tải về khớp với Release, không xác nhận danh tính nhà phát triển hay trạng thái notarization.
@@ -81,7 +81,7 @@ echo '751fdf7439f115d87ee2a8f3f18c065b6151852068e3e666ac60ac2996f75ac9  node-v26
 tar -xzf node-v26.10.0-darwin-arm64.tar.gz
 export OPENMINDMAP_NODE_BIN="$PWD/node-v26.10.0-darwin-arm64/bin/node"
 bun run build
-./macos/build-mac-app.sh --dmg dist/OpenMindmap-0.2.1-arm64.dmg
+./macos/build-mac-app.sh --dmg dist/OpenMindmap-0.2.2-arm64.dmg
 ~~~
 
 Lệnh đóng gói từ chối ghi đè đầu ra có cùng tên. Kết quả được ký ad hoc và không được notarize tự động. Tệp Node.js runtime không được lưu trong Git, nhưng được nhúng trong ứng dụng macOS sau khi kiểm tra phiên bản và kiến trúc.

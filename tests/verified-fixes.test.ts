@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach } from 'bun:test'
-import { useApp as app } from '../lib/store'
+import { captureProjectRenameTarget, useApp as app } from '../lib/store'
 import { newProjectDoc, newTopic, parseProjectJSON } from '../lib/core/types'
-import { collectRecoveryCandidates, defaultSettings, loadProject, STORAGE_KEYS as K, simpleHash } from '../lib/storage/projects'
+import { collectRecoveryCandidates, defaultSettings, loadProject, STORAGE_KEYS as K, simpleHash, metaFromDoc, recentProjects, pushTrash, trashList } from '../lib/storage/projects'
 import { assertImportSize, buildImportPreview, detectFormat } from '../lib/io/importers'
 import { persistProject, withStorageWrite } from '../lib/storage/persistence'
 import { copyBranch, pasteBranch } from '../lib/core/clipboard'
@@ -155,7 +155,8 @@ describe('B01/B04 project lifecycle', () => {
   })
   test('journal cleared only after verified save', async () => {
     app.getState().startEdit('child', 'title'); app.getState().updateDraft('Draft'); app.getState().commitEdit()
-    const key = K.journal(app.getState().doc!.project_id); expect(memory.has(key)).toBe(true)
+    const key = K.journal(app.getState().doc!.project_id)
+    await withStorageWrite(() => expect(memory.has(key)).toBe(true))
     await app.getState().saveNow(); expect(memory.has(key)).toBe(false)
   })
 })
@@ -281,9 +282,10 @@ test('verified Undo save does not resurrect a committed draft on restart', async
 })
 
 test('registry read-back validates all metadata, not just count and revision', async () => {
-  const { metaFromDoc } = await import('../lib/storage/projects')
   const doc = app.getState().doc!, meta = metaFromDoc(doc)
-  memory.set(K.registry, JSON.stringify([{ ...meta, updatedAt: 'STALE' }]))
+  const stored = { ...meta, updatedAt: 'STALE' }
+  memory.set(K.registry, JSON.stringify([stored]))
+  app.setState({ registry: [stored] })
   const write = localStorage.setItem
   localStorage.setItem = (key: string, value: string) => { if (key !== K.registry) write(key, value) }
   try { expect((await app.getState().saveNow()).kind).toBe('error') }
@@ -354,6 +356,117 @@ test('QA15 a verified recovery with pending registry write retries exactly once'
   expect(await resumed).toBe(true)
   expect(memory.get(K.project(source.project_id))).toBe(verified)
   expect(memory.has(K.journal(source.project_id))).toBe(false)
+})
+
+test('permanent removal cannot be raced by a stale restore or queued project auxiliaries', async () => {
+  const doc = app.getState().doc!
+  const id = doc.project_id
+  const other = newProjectDoc('Other')
+  const registry = [metaFromDoc(doc), metaFromDoc(other)]
+  memory.set(K.registry, JSON.stringify(registry))
+  app.setState({ registry })
+  memory.set(K.project(other.project_id), JSON.stringify(other))
+  memory.set(K.backup(id), JSON.stringify([{ rev: doc.document_revision, json: JSON.stringify(doc) }]))
+  memory.set(K.backup(other.project_id), 'other backup')
+  memory.set(K.session(id), '{"camera":{"x":3,"y":4,"zoom":1}}')
+  memory.set(K.session(other.project_id), 'other session')
+  memory.set(K.journal(other.project_id), 'other draft')
+  memory.set(K.settings, JSON.stringify({ ...defaultSettings(), lastProjectId: id, sessionByProject: { [id]: {}, [other.project_id]: {} } }))
+  pushTrash(doc)
+  const item = trashList()[0]
+  const backup = memory.get(K.backup(id))
+  expect(await app.getState().purgeTrash(item)).toBe(false)
+  expect(memory.get(K.backup(id))).toBe(backup)
+  memory.delete(K.project(id))
+
+  const originalRemove = localStorage.removeItem
+  localStorage.removeItem = key => {
+    if (key === K.session(id)) throw new Error('TEST_SESSION_REMOVE')
+    originalRemove(key)
+  }
+  try {
+    expect(await app.getState().purgeTrash(item)).toBe(false)
+    expect(trashList()[0]).toEqual(item)
+  } finally { localStorage.removeItem = originalRemove }
+
+  const purge = app.getState().purgeTrash(item)
+  app.getState().setCamera({ x: 99, y: 40, zoom: 2 })
+  app.getState().startEdit('child', 'title')
+  app.getState().updateDraft('Late draft')
+  app.getState().commitEdit()
+  const restore = app.getState().restoreTrash(item)
+  expect(await purge).toBe(true)
+  expect(await restore).toBe(false)
+  await new Promise(resolve => setTimeout(resolve, 275))
+  await withStorageWrite(() => {
+    for (const key of [K.project(id), K.backup(id), K.journal(id), K.session(id)]) expect(memory.has(key)).toBe(false)
+  })
+  expect(trashList()).toEqual([])
+  expect(JSON.parse(memory.get(K.registry)!)).toEqual([registry[1]])
+  expect(JSON.parse(memory.get(K.settings)!).lastProjectId).toBeNull()
+  expect(JSON.parse(memory.get(K.settings)!).sessionByProject).toEqual({ [other.project_id]: {} })
+  expect(memory.get(K.project(other.project_id))).toBe(JSON.stringify(other))
+  expect(memory.get(K.backup(other.project_id))).toBe('other backup')
+  expect(memory.get(K.journal(other.project_id))).toBe('other draft')
+  expect(memory.get(K.session(other.project_id))).toBe('other session')
+})
+
+test('a partially persisted trash restore reuses its candidate and excludes stale purge', async () => {
+  const doc = app.getState().doc!
+  pushTrash(doc)
+  const item = trashList()[0]
+  const originalSet = localStorage.setItem
+  localStorage.setItem = (key, value) => {
+    if (key === K.trash && JSON.parse(value).length === 0) throw new Error('TEST_TRASH_FINALIZE')
+    originalSet(key, value)
+  }
+  try { expect(await app.getState().restoreTrash(item)).toBe(false) }
+  finally { localStorage.setItem = originalSet }
+  const restoreId = trashList()[0].restoreId!
+  expect(restoreId).not.toBe(doc.project_id)
+  expect(memory.has(K.project(restoreId))).toBe(true)
+  const retry = app.getState().restoreTrash(item)
+  const stalePurge = app.getState().purgeTrash(item)
+  expect(await retry).toBe(true)
+  expect(await stalePurge).toBe(false)
+  expect(trashList()).toEqual([])
+  expect([...memory.keys()].filter(key => key.startsWith('omm.project.')).sort()).toEqual([K.project(doc.project_id), K.project(restoreId)].sort())
+  expect(memory.get(K.project(doc.project_id))).toBe(JSON.stringify(doc))
+  expect(loadProject(restoreId)?.topics).toEqual(doc.topics)
+})
+
+test('hide from Recent survives save and reload and an explicit open unhides it', async () => {
+  const doc = app.getState().doc!
+  const id = doc.project_id
+  const metadata = metaFromDoc(doc)
+  const source = memory.get(K.project(id))
+  memory.set(K.registry, JSON.stringify([metadata]))
+  memory.set(K.settings, JSON.stringify({ ...defaultSettings(), autosaveEnabled: false, lastProjectId: id }))
+  app.setState({ registry: [metadata] })
+  expect(await app.getState().removeRecent(id)).toBe(true)
+  expect(memory.get(K.project(id))).toBe(source)
+  expect(app.getState().registry[0].id).toBe(id)
+  expect(recentProjects(app.getState().registry)).toEqual([])
+  edit('Still available')
+  expect((await app.getState().saveNow()).kind).toBe('saved')
+  expect(recentProjects(app.getState().registry)).toEqual([])
+  expect(await app.getState().resolveConflictReload()).toBe(true)
+  expect(recentProjects(app.getState().registry)).toEqual([])
+  expect(await app.getState().openProject(id)).toBe(true)
+  expect(recentProjects(app.getState().registry).map(meta => meta.id)).toEqual([id])
+})
+
+test('Project V3 preserves valid version notes and normalizes unsupported values', async () => {
+  const { remapProject } = await import('../lib/io/importers')
+  const doc = app.getState().doc!
+  for (const value of ['Phê duyệt 🗺️', '', null, undefined, 12]) {
+    const parsed = parseProjectJSON(JSON.stringify({ ...doc, version_note: value })).doc
+    const expected = typeof value === 'string' ? value : null
+    expect(parsed.version_note).toBe(expected)
+    expect(remapProject(parsed).version_note).toBe(expected)
+    expect(parsed.project_id).toBe(doc.project_id)
+    expect(parsed.topics[1].parent_id).toBe(parsed.central_topic_id)
+  }
 })
 
 test('QA04 trash failures preserve the source or a verified trash copy and allow retry', async () => {
@@ -553,19 +666,19 @@ describe('UI07 Fixed geometry and editor failure', () => {
     s.undo(); expect(app.getState().doc!.topics).toEqual(d.topics)
     app.getState().redo(); expect(app.getState().doc!.topics[1]).toEqual(changed)
   })
-  test('over-limit commit keeps document, draft and journal; selection/tab/editor cannot replace it', () => {
+  test('over-limit commit keeps document, draft and journal; selection/tab/editor cannot replace it', async () => {
     const d = fixed(); const text = Array(100).fill('Dòng tiếng Việt').join('\n')
     app.getState().startEdit('child', 'title'); app.getState().updateDraft(text)
     expect(app.getState().commitEdit()).toBe(false)
     expect(app.getState().doc).toEqual(d); expect(app.getState().past).toHaveLength(0)
     expect(app.getState().editor!.draft).toBe(text)
-    expect(JSON.parse(memory.get(K.journal(d.project_id))!).draft_text).toBe(text)
+    await withStorageWrite(() => expect(JSON.parse(memory.get(K.journal(d.project_id))!).draft_text).toBe(text))
     app.getState().setSelection([d.central_topic_id]); expect(app.getState().selection).toEqual([])
     const inspector = app.getState().inspectorOpen
     app.getState().setInspector(!inspector, 'box'); expect(app.getState().inspectorOpen).toBe(inspector)
     app.getState().startEdit(d.central_topic_id, 'title'); expect(app.getState().editor!.nodeId).toBe('child')
     app.getState().cancelEdit(); expect(app.getState().doc).toEqual(d)
-    expect(memory.has(K.journal(d.project_id))).toBe(false)
+    await withStorageWrite(() => expect(memory.has(K.journal(d.project_id))).toBe(false))
   })
   test('Save and continue stops if Fixed validation rejects the draft', async () => {
     const d = fixed(); app.getState().startEdit('child', 'title'); app.getState().updateDraft(Array(100).fill('Dòng').join('\n'))
@@ -813,4 +926,420 @@ describe('audit fixes 2026-11-11', () => {
       expect(n.image!.h / n.image!.w).not.toBeCloseTo(200 / 60, 2)
     }
   })
+})
+
+test('trash retries a reserved original ID after a failed document or metadata write', async () => {
+  const doc = app.getState().doc!
+  const id = doc.project_id
+  memory.delete(K.project(id))
+  const snapshot = pushTrash(doc)
+  failKey = K.project(id)
+  expect(await app.getState().restoreTrash(snapshot)).toBe(false)
+  expect(trashList()[0].restoreId).toBe(id)
+  expect(trashList()[0].restorePrepared).toBeUndefined()
+  expect(memory.has(K.project(id))).toBe(false)
+
+  failKey = K.registry
+  expect(await app.getState().restoreTrash(snapshot)).toBe(false)
+  const prepared = trashList()[0]
+  expect(prepared.restorePrepared).toBe(true)
+  expect(memory.get(K.project(id))).toBe(JSON.stringify(doc))
+  expect(memory.get(K.registry)).toBe('[]')
+
+  failKey = ''
+  expect(await app.getState().restoreTrash(snapshot)).toBe(true)
+  expect(JSON.parse(memory.get(K.registry)!)[0].storageEpoch).toBe(prepared.restoreEpoch)
+  expect(trashList()).toEqual([])
+})
+
+test('a published trash restore can be retired without changing the edited live document', async () => {
+  const doc = app.getState().doc!
+  const id = doc.project_id
+  memory.delete(K.project(id))
+  const snapshot = pushTrash(doc)
+  const write = localStorage.setItem
+  localStorage.setItem = (key, value) => {
+    if (key === K.trash && value === '[]') throw new Error('TEST_TRASH_FINALIZE')
+    write(key, value)
+  }
+  try { expect(await app.getState().restoreTrash(snapshot)).toBe(false) }
+  finally { localStorage.setItem = write }
+  const current = loadProject(id)!
+  current.topics[1].text = 'Edited after publication'
+  expect((await persistProject(current, memory.get(K.project(id))!)).kind).toBe('saved')
+  const raw = memory.get(K.project(id))
+  const registry = memory.get(K.registry)
+  expect(await app.getState().restoreTrash(snapshot)).toBe(true)
+  expect(memory.get(K.project(id))).toBe(raw)
+  expect(memory.get(K.registry)).toBe(registry)
+  expect(trashList()).toEqual([])
+})
+
+for (const keepOriginal of [false, true]) {
+  test('moving a published restore back to trash retires its prior snapshot, copy=' + keepOriginal, async () => {
+    const doc = app.getState().doc!
+    const id = doc.project_id
+    if (!keepOriginal) memory.delete(K.project(id))
+    const snapshot = pushTrash(doc)
+    const write = localStorage.setItem
+    localStorage.setItem = (key, value) => {
+      if (key === K.trash && value === '[]') throw new Error('TEST_TRASH_FINALIZE')
+      write(key, value)
+    }
+    try { expect(await app.getState().restoreTrash(snapshot)).toBe(false) }
+    finally { localStorage.setItem = write }
+    const restored = trashList()[0]
+    const restoreId = restored.restoreId!
+    expect(restoreId === id).toBe(!keepOriginal)
+    const current = loadProject(restoreId)!
+    current.topics[1].text = 'Fresh snapshot'
+    expect((await persistProject(current, memory.get(K.project(restoreId))!)).kind).toBe('saved')
+    // Simulate closing the active editor before issuing the sidebar delete.
+    app.setState({ doc: null, generation: app.getState().generation + 1, saveStatus: 'none', persistedRaw: null })
+    app.getState().deleteProject(restoreId)
+    expect(await app.getState().confirm?.onOk()).toBe(true)
+    expect(trashList()).toHaveLength(1)
+    const next = trashList()[0]
+    expect(next.id).toBe(restoreId)
+    expect(next.deletionId).not.toBe(snapshot.deletionId)
+    expect(next.doc.topics[1].text).toBe('Fresh snapshot')
+    expect(await app.getState().restoreTrash(snapshot)).toBe(false)
+    expect(await app.getState().purgeTrash(next)).toBe(true)
+    expect(await app.getState().restoreTrash(restored)).toBe(false)
+    expect(memory.has(K.project(restoreId))).toBe(false)
+    expect(memory.has(K.project(id))).toBe(keepOriginal)
+  })
+}
+
+test('a missing candidate after restore preparation is not recreated from a stale snapshot', async () => {
+  const doc = app.getState().doc!
+  memory.delete(K.project(doc.project_id))
+  const snapshot = pushTrash(doc)
+  failKey = K.registry
+  expect(await app.getState().restoreTrash(snapshot)).toBe(false)
+  expect(trashList()[0].restorePrepared).toBe(true)
+  memory.delete(K.project(doc.project_id))
+  failKey = ''
+  expect(await app.getState().restoreTrash(snapshot)).toBe(false)
+  expect(memory.has(K.project(doc.project_id))).toBe(false)
+  expect(trashList()).toHaveLength(1)
+})
+
+test('restoring a partial deletion keeps the original ID and prevents stale writes before publication', async () => {
+  const doc = app.getState().doc!
+  const id = doc.project_id
+  const original = memory.get(K.project(id))!
+  const legacyMeta = { ...metaFromDoc(doc), storageEpoch: undefined }
+  memory.set(K.registry, JSON.stringify([legacyMeta]))
+  app.setState({ registry: [legacyMeta] })
+  const journal = '{"unrelatedDraft":true}'
+  const backup = JSON.stringify([{ rev: doc.document_revision, json: original }])
+  memory.set(K.journal(id), journal)
+  memory.set(K.backup(id), backup)
+  failKey = K.registry
+  app.getState().deleteProject(id)
+  expect(await app.getState().confirm?.onOk()).toBe(false)
+  expect(memory.has(K.project(id))).toBe(false)
+  expect(trashList()[0].sourceStorageEpoch).toBeNull()
+  expect(JSON.parse(memory.get(K.registry)!)[0].id).toBe(id)
+
+  failKey = ''
+  const snapshot = trashList()[0]
+  const write = localStorage.setItem
+  localStorage.setItem = (key, value) => {
+    if (key === K.registry && JSON.parse(value).some((meta: { id: string }) => meta.id === id)) {
+      throw new Error('TEST_PUBLISH_FAILURE')
+    }
+    write(key, value)
+  }
+  try { expect(await app.getState().restoreTrash(snapshot)).toBe(false) }
+  finally { localStorage.setItem = write }
+  expect(memory.get(K.project(id))).toBe(original)
+  expect(memory.get(K.registry)).toBe('[]')
+  expect(trashList()[0].restorePrepared).toBe(true)
+  expect((await persistProject(doc, original, { identity: { storageEpoch: undefined } })).kind).toBe('conflict')
+  expect(await app.getState().renameStoredProject(id, 'Stale rename')).toBe(false)
+  const oldState = app.getState()
+  app.setState({ doc: null, generation: oldState.generation + 1, saveStatus: 'none' })
+  expect(await app.getState().openProject(id)).toBe(false)
+  expect(memory.get(K.project(id))).toBe(original)
+  expect(memory.get(K.journal(id))).toBe(journal)
+
+  expect(await app.getState().restoreTrash(snapshot)).toBe(true)
+  expect(trashList()).toHaveLength(0)
+  const registry = JSON.parse(memory.get(K.registry)!)
+  expect(registry).toHaveLength(1)
+  expect(registry[0].id).toBe(id)
+  expect(typeof registry[0].storageEpoch).toBe('string')
+  expect(memory.get(K.backup(id))).toBe(backup)
+  expect(await app.getState().openProject(id)).toBe(true)
+})
+
+test('restore cannot claim an orphan metadata row from a different epoch', async () => {
+  const doc = app.getState().doc!
+  const id = doc.project_id
+  const current = metaFromDoc(doc)
+  memory.set(K.registry, JSON.stringify([current]))
+  memory.delete(K.project(id))
+  const snapshot = pushTrash(doc, [], 'different-epoch')
+  expect(await app.getState().restoreTrash(snapshot)).toBe(false)
+  expect(memory.has(K.project(id))).toBe(false)
+  expect(memory.get(K.registry)).toBe(JSON.stringify([current]))
+  expect(trashList()).toEqual([snapshot])
+})
+
+test('opening an older formatted document leaves its bytes intact and it can still be moved to trash', async () => {
+  const doc = app.getState().doc!
+  const id = doc.project_id
+  const raw = JSON.stringify(doc, null, 2)
+  memory.set(K.project(id), raw)
+  const metadata = { ...metaFromDoc(doc), storageEpoch: undefined }
+  memory.set(K.registry, JSON.stringify([metadata]))
+  app.setState({ doc: null, persistedRaw: null, saveStatus: 'none', registry: [metadata] })
+  expect(await app.getState().openProject(id)).toBe(true)
+  expect(memory.get(K.project(id))).toBe(raw)
+  app.getState().deleteProject(id)
+  expect(await app.getState().confirm?.onOk()).toBe(true)
+  expect(memory.has(K.project(id))).toBe(false)
+  expect(trashList()[0].doc).toEqual(doc)
+})
+
+test('an explicit purge can remove a failed restore reservation if no document was written', async () => {
+  const doc = app.getState().doc!
+  const id = doc.project_id
+  memory.delete(K.project(id))
+  const snapshot = pushTrash(doc)
+  failKey = K.project(id)
+  expect(await app.getState().restoreTrash(snapshot)).toBe(false)
+  expect(trashList()[0].restoreId).toBe(id)
+  failKey = ''
+  expect(await app.getState().purgeTrash(snapshot)).toBe(true)
+  expect(await app.getState().restoreTrash(snapshot)).toBe(false)
+  expect(trashList()).toHaveLength(0)
+  expect(memory.has(K.project(id))).toBe(false)
+})
+
+test('trash capacity retains pending restores and verifies every retained marker before removing the source', async () => {
+  const source = app.getState().doc!
+  const originalRaw = memory.get(K.project(source.project_id))
+  app.setState({ doc: null, persistedRaw: null, saveStatus: 'none' })
+  const pending = pushTrash(newProjectDoc('Unpublished restore'))
+  failKey = K.registry
+  expect(await app.getState().restoreTrash(pending)).toBe(false)
+  failKey = ''
+  const reserved = trashList()[0]
+  expect(reserved.restorePrepared).toBe(true)
+  const oldestOrdinary = pushTrash(newProjectDoc('Oldest completed deletion'))
+  for (let i = 0; i < 48; i++) pushTrash(newProjectDoc('Deleted project ' + i))
+
+  const previous = memory.get(K.trash)!
+  const write = localStorage.setItem
+  localStorage.setItem = (key, value) => {
+    const entries = key === K.trash ? JSON.parse(value) as typeof reserved[] : []
+    if (entries[0]?.id === source.project_id) {
+      write(key, JSON.stringify(entries.filter(entry => entry.id !== pending.id)))
+    } else {
+      write(key, value)
+    }
+  }
+  app.getState().deleteProject(source.project_id)
+  try { expect(await app.getState().confirm?.onOk()).toBe(false) }
+  finally { localStorage.setItem = write }
+  expect(memory.get(K.project(source.project_id))).toBe(originalRaw)
+  expect(memory.get(K.trash)).toBe(previous)
+
+  expect(await app.getState().confirm?.onOk()).toBe(true)
+  const result = trashList()
+  expect(result).toHaveLength(50)
+  expect(result[0].id).toBe(source.project_id)
+  expect(result.find(entry => entry.id === pending.id)).toEqual(reserved)
+  expect(result.some(entry => entry.id === oldestOrdinary.id)).toBe(false)
+  expect(await app.getState().restoreTrash(reserved)).toBe(true)
+  expect(loadProject(pending.id)?.project_id).toBe(pending.id)
+})
+
+test('trash capacity refuses a new deletion when all 50 entries require protection', async () => {
+  const source = app.getState().doc!
+  const raw = memory.get(K.project(source.project_id))
+  const metadata = metaFromDoc(source)
+  memory.set(K.registry, JSON.stringify([metadata]))
+  app.setState({ registry: [metadata] })
+  const items = Array.from({ length: 50 }, (_, index) => {
+    const doc = newProjectDoc('Incomplete restore ' + index)
+    return { id: doc.project_id, doc, name: doc.name, deletedAt: doc.updated_at,
+      restoreId: doc.project_id, restoreEpoch: 'reservation-' + index }
+  })
+  const before = JSON.stringify(items)
+  memory.set(K.trash, before)
+  app.getState().deleteProject(source.project_id)
+  expect(await app.getState().confirm?.onOk()).toBe(false)
+  expect(memory.get(K.project(source.project_id))).toBe(raw)
+  expect(memory.get(K.trash)).toBe(before)
+  expect(memory.get(K.registry)).toBe(JSON.stringify([metadata]))
+  expect(app.getState().saveStatus).toBe('clean')
+  expect(app.getState().saveError).toBeNull()
+  expect(app.getState().doc).toBe(source)
+  const close = app.getState().closeProject()
+  const prompted = app.getState().leavePrompt !== null
+  if (prompted) await app.getState().chooseLeave('cancel')
+  expect(prompted).toBe(false)
+  expect(await close).toBe(true)
+})
+
+test('a rejected deletion reports a same-epoch external document change as a conflict', async () => {
+  const original = app.getState().doc!
+  const id = original.project_id
+  const metadata = metaFromDoc(original)
+  const registryRaw = JSON.stringify([metadata])
+  memory.set(K.registry, registryRaw)
+  app.setState({ registry: [metadata] })
+  app.getState().deleteProject(id)
+  const externalRaw = JSON.stringify({ ...original, name: 'Other tab title' })
+  memory.set(K.project(id), externalRaw)
+
+  expect(await app.getState().confirm?.onOk()).toBe(false)
+  expect(app.getState().saveStatus).toBe('conflict')
+  expect(app.getState().doc).toBe(original)
+  expect(memory.get(K.project(id))).toBe(externalRaw)
+  expect(memory.get(K.registry)).toBe(registryRaw)
+  expect(memory.get(K.trash)).toBeUndefined()
+})
+
+test('trash write lock timeout preserves a clean document', async () => {
+  const source = app.getState().doc!
+  const raw = app.getState().persistedRaw
+  const metadata = metaFromDoc(source)
+  memory.set(K.registry, JSON.stringify([metadata]))
+  app.setState({ registry: [metadata] })
+  app.getState().deleteProject(source.project_id)
+  const locks = navigator.locks
+  const request = locks.request
+  locks.request = ((_name: string, options: LockOptions) => new Promise((_resolve, reject) => {
+    options.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true })
+  })) as LockManager['request']
+  try {
+    expect(await app.getState().confirm?.onOk()).toBe(false)
+    expect(app.getState().saveStatus).toBe('clean')
+    expect(app.getState().saveError).toBeNull()
+    expect(app.getState().doc).toBe(source)
+    expect(memory.get(K.project(source.project_id))).toBe(raw)
+    expect(memory.get(K.trash)).toBeUndefined()
+    expect(app.getState().toasts.at(-1)).toMatchObject({
+      text: 'Chuyển vào thùng rác thất bại',
+      detail: expect.stringContaining('Hết thời gian chờ khóa ghi'),
+    })
+  } finally {
+    locks.request = request
+  }
+}, 7000)
+
+test.each(['same tab', 'settings write failure', 'settings read-back failure', 'other tab', 'same-byte restore'])('legacy sidebar rename after epoch assignment by %s', async (scenario) => {
+  const source = newProjectDoc('Legacy project')
+  const id = source.project_id
+  const raw = JSON.stringify(source)
+  const meta = { ...metaFromDoc(source), storageEpoch: undefined }
+  memory.set(K.project(id), raw)
+  memory.set(K.registry, JSON.stringify([meta]))
+  app.setState({ registry: [meta] })
+  const target = captureProjectRenameTarget(meta)
+  expect(target.legacy).toEqual({ raw, generation: app.getState().generation })
+
+  if (scenario.startsWith('settings')) {
+    const before = app.getState()
+    const read = localStorage.getItem
+    try {
+      if (scenario === 'settings write failure') failKey = K.settings
+      else {
+        localStorage.getItem = key => {
+          const value = read(key)
+          if (key === K.settings && JSON.parse(value ?? '{}').lastProjectId === id) return null
+          return value
+        }
+      }
+      expect(await app.getState().openProject(id)).toBe(false)
+    } finally {
+      failKey = ''
+      localStorage.getItem = read
+    }
+    const assigned = JSON.parse(memory.get(K.registry)!)[0].storageEpoch
+    expect(assigned).toBeString()
+    expect(await app.getState().renameStoredProject(id, 'Blocked before retry', target)).toBe(false)
+    expect(app.getState().doc).toBe(before.doc)
+    expect(app.getState().past).toBe(before.past)
+    expect(app.getState().future).toBe(before.future)
+    expect(memory.get(K.project(id))).toBe(raw)
+  } else if (scenario === 'other tab') {
+    memory.set(K.registry, JSON.stringify([{ ...meta, storageEpoch: 'other-tab-epoch' }]))
+  } else if (scenario === 'same-byte restore') {
+    app.getState().deleteProject(id)
+    expect(await app.getState().confirm?.onOk()).toBe(true)
+    expect(await app.getState().restoreTrash(trashList()[0])).toBe(true)
+    expect(memory.get(K.project(id))).toBe(raw)
+  }
+
+  expect(await app.getState().openProject(id)).toBe(true)
+  const before = app.getState()
+  expect(before.doc?.name).toBe(source.name)
+  const renamed = await app.getState().renameStoredProject(id, 'New title', target)
+  if (scenario === 'same tab') {
+    expect(renamed).toBe(true)
+    expect(app.getState().doc?.name).toBe('New title')
+    expect(app.getState().past).toHaveLength(1)
+    app.getState().undo()
+    expect(app.getState().doc?.name).toBe(source.name)
+    app.getState().redo()
+    expect(app.getState().doc?.name).toBe('New title')
+  } else {
+    expect(renamed).toBe(false)
+    expect(app.getState().doc).toBe(before.doc)
+    expect(app.getState().past).toBe(before.past)
+    expect(app.getState().future).toBe(before.future)
+  }
+  expect(memory.get(K.project(id))).toBe(raw)
+})
+
+test('sidebar rename revalidates its epoch before choosing either the store or the newly opened editor', async () => {
+  const source = newProjectDoc('Before restore')
+  const id = source.project_id
+  const initial = app.getState()
+  const old = metaFromDoc(source)
+  const raw = JSON.stringify(source)
+  memory.set(K.project(id), raw)
+  memory.set(K.registry, JSON.stringify([old]))
+  app.setState({ registry: [old] })
+  app.getState().deleteProject(id)
+  expect(await app.getState().confirm?.onOk()).toBe(true)
+  const snapshot = trashList()[0]
+  failKey = K.registry
+  expect(await app.getState().restoreTrash(snapshot)).toBe(false)
+  failKey = ''
+
+  let release!: () => void
+  let locked!: () => void
+  const acquired = new Promise<void>(resolve => { locked = resolve })
+  const hold = withStorageWrite(() => new Promise<void>(resolve => { release = resolve; locked() }))
+  await acquired
+  const restore = app.getState().restoreTrash(snapshot)
+  const renameClosed = app.getState().renameStoredProject(id, 'Stale closed title', old)
+  const open = app.getState().openProject(id)
+  const renameAfterOpen = app.getState().renameStoredProject(id, 'Stale active title', old)
+  release()
+  await hold
+  expect(await restore).toBe(true)
+  expect(await renameClosed).toBe(false)
+  expect(await open).toBe(true)
+  expect(await renameAfterOpen).toBe(false)
+  expect(app.getState().doc?.name).toBe(source.name)
+  expect(app.getState().past).toHaveLength(0)
+  expect(memory.get(K.project(id))).toBe(raw)
+  const current = app.getState().registry.find(entry => entry.id === id)!
+  expect(current.storageEpoch).not.toBe(old.storageEpoch)
+  expect(await app.getState().renameStoredProject(id, 'New active title', current)).toBe(true)
+  expect(app.getState().doc?.name).toBe('New active title')
+  expect(memory.get(K.project(id))).toBe(raw)
+  app.getState().undo()
+  expect(app.getState().doc?.name).toBe(source.name)
+  app.setState({ doc: initial.doc, persistedRaw: initial.persistedRaw, generation: initial.generation + 10 })
+  expect(await app.getState().renameStoredProject(id, 'New stored title', current)).toBe(true)
+  expect(loadProject(id)?.name).toBe('New stored title')
 })

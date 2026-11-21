@@ -14,7 +14,7 @@ import {
 import { download } from '../lib/io/exporters'
 import { isNativeMacOS } from '../lib/native/bridge'
 
-type TransferBridgeMsg = { ok?: boolean; code?: string; error?: string; journal?: TransferJournalState | null; mode?: 'start' | 'resume'; path?: string }
+type TransferBridgeMsg = { ok?: boolean; code?: string; error?: string; journal?: TransferJournalState | null; path?: string }
 
 const pendingNativeCalls = new Map<string, (res: TransferBridgeMsg) => void>()
 
@@ -109,52 +109,49 @@ export function TransferView() {
   }
 
   const handleRunImport = async () => {
-    if (!targetPkg) return
+    if (!targetPkg || status.kind === 'busy') return
     setStatus({ kind: 'busy', text: 'Đang nạp và xác minh SHA-256 từng khóa dữ liệu…' })
     setProgress({ done: 0, total: targetPkg.entries.length })
 
-    const hooks: TransferJournalHooks = nativeMac
-      ? {
-          beginOrResume: async (packageSha256, totalKeys) => {
-            const res = await callNativeTransfer({ action: 'beginOrResume', packageSha256, totalKeys })
-            return res.ok && res.journal
-              ? { ok: true, mode: res.mode ?? 'start', journal: res.journal }
-              : { ok: false, code: res.code, error: res.error ?? 'Không khởi tạo được journal.' }
-          },
-          markKey: async (key, sha256) => {
-            const res = await callNativeTransfer({ action: 'markKey', key, sha256 })
-            return res.ok ? { ok: true } : { ok: false, error: res.error ?? 'Lỗi ghi journal.' }
-          },
-          complete: async () => {
-            const res = await callNativeTransfer({ action: 'complete' })
-            return res.ok ? { ok: true } : { ok: false, error: res.error ?? 'Lỗi hoàn tất journal.' }
-          },
-          rollback: async (reason) => {
-            const res = await callNativeTransfer({ action: 'rollback', reason })
-            return res.ok ? { ok: true } : { ok: false, error: res.error ?? 'Lỗi rollback.' }
-          },
-        }
-      : {
-          beginOrResume: async () => ({ ok: false, error: 'Chế độ đích chỉ chạy trong ứng dụng OpenMindmap macOS.' }),
-          markKey: async () => ({ ok: false, error: 'Unsupported' }),
-          complete: async () => ({ ok: false, error: 'Unsupported' }),
-          rollback: async () => ({ ok: false, error: 'Unsupported' }),
-        }
+    const packageSha256 = targetPkg.digestSha256
+    const nativeJournalWrite = async (action: string, payload: Record<string, unknown> = {}) => {
+      const res = await callNativeTransfer({ action, ...payload, packageSha256 })
+      return res.ok ? { ok: true as const } : { ok: false as const, error: res.error ?? 'Lỗi journal macOS.' }
+    }
+    const hooks: TransferJournalHooks = {
+      getState: async () => {
+        const res = await callNativeTransfer({ action: 'getState' })
+        if (!res.ok) throw new Error(res.error ?? 'Không đọc được trạng thái journal.')
+        return res.journal ?? null
+      },
+      beginOrResume: (packageSha256, totalKeys, replaceLegacyId) => nativeMac
+        ? nativeJournalWrite('beginOrResume', { packageSha256, totalKeys, replaceLegacyId: replaceLegacyId ?? null })
+        : Promise.resolve({ ok: false, error: 'Chế độ đích chỉ chạy trong ứng dụng OpenMindmap macOS.' }),
+      blockIntent: (transferId, key) => nativeJournalWrite('blockIntent', { transferId, key }),
+      prepareKey: intent => nativeJournalWrite('prepareKey', intent),
+      markKey: intent => nativeJournalWrite('markKey', intent),
+      prepareRollback: (transferId, pending) => nativeJournalWrite('prepareRollback', { transferId, ...pending }),
+      prepareFinalFlag: transferId => nativeJournalWrite('prepareFinalFlag', { transferId }),
+      complete: transferId => nativeJournalWrite('complete', { transferId }),
+      rollback: (transferId, reason) => nativeJournalWrite('rollback', { transferId, reason }),
+    }
 
-    const result = await importWorkspaceTransactional(targetPkg, window.localStorage, hooks, {
-      onProgress: (done, total) => setProgress({ done, total }),
-    })
-
-    await refreshTargetState()
-    if (result.ok) {
-      setStatus({ kind: 'ok', text: result.message })
-    } else {
-      setStatus({ kind: 'error', text: result.message })
+    try {
+      const result = await importWorkspaceTransactional(targetPkg, window.localStorage, hooks, {
+        onProgress: (done, total) => setProgress({ done, total }),
+      })
+      setStatus({ kind: result.ok || result.verifiedComplete ? 'ok' : 'error', text: result.message })
+    } catch (error) {
+      setStatus({ kind: 'error', text: `Chưa xác nhận được việc chuyển dữ liệu: ${error instanceof Error ? error.message : String(error)}. Hãy thử lại với cùng gói.` })
+    } finally {
+      setProgress(null)
+      await refreshTargetState().catch(() => {})
     }
   }
 
   const handleOpenMainApp = async () => {
-    await callNativeTransfer({ action: 'exitTransferToApp' })
+    const result = await callNativeTransfer({ action: 'exitTransferToApp', transferId: journal?.transferId ?? null })
+    if (!result.ok) setStatus({ kind: 'error', text: result.error ?? 'Chưa xác nhận được dữ liệu đã chuyển.' })
   }
 
   return (
@@ -211,6 +208,7 @@ export function TransferView() {
               <span className="text-[13px] font-medium">Chọn tệp gói chuyển dữ liệu (<code>openmindmap-workspace-transfer-*.json</code>)</span>
               <input
                 type="file"
+                disabled={status.kind === 'busy'}
                 accept=".json"
                 className="hidden"
                 onChange={(e) => {
@@ -240,7 +238,7 @@ export function TransferView() {
               >
                 {journal?.status === 'in_progress' ? 'Tiếp tục chuyển dữ liệu' : 'Bắt đầu chuyển dữ liệu'}
               </button>
-              {status.kind === 'ok' && nativeMac && (
+              {status.kind === 'ok' && nativeMac && journal?.status === 'completed' && (
                 <button
                   type="button"
                   onClick={() => void handleOpenMainApp()}

@@ -3,7 +3,7 @@ import { getTopic, descendantsOf } from './tree'
 import { uuid } from './types'
 import { BranchClipboard, copyBranch, pasteBranch } from './clipboard'
 import { cmdBuilders } from './commands'
-import { trashList } from '../storage/projects'
+import { recentProjects, trashList } from '../storage/projects'
 import { download } from '../io/exporters'
 
 export type MenuCommandId =
@@ -440,7 +440,7 @@ export function buildCatalogItems(st: AppState = useApp.getState()): CatalogItem
       id: 'A05_OPEN_RECENT',
       group: 'Khác',
       label: 'Mở dự án gần đây',
-      disabled: !st.registry.length,
+      disabled: recentProjects(st.registry).length === 0,
       run: (targetId?: string) => {
         if (targetId) void cur().openProject(targetId)
       },
@@ -477,7 +477,7 @@ export function buildMenuStateSnapshot(viewSession: string, st: AppState = useAp
     focusedField: isFocusedTextField(),
     editingNode: !!st.editor,
     trashCount,
-    recentProjects: st.registry.slice(0, 8).map((m) => ({
+    recentProjects: recentProjects(st.registry).slice(0, 8).map((m) => ({
       id: m.id,
       name: m.name,
       updatedAt: m.updatedAt,

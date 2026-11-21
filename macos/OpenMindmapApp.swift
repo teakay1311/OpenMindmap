@@ -301,7 +301,7 @@ final class OpenMindmapLauncher: NSObject,
         let ucc = WKUserContentController()
         let meta: [String: Any] = [
             "platform": "macos",
-            "appVersion": "0.2.1",
+            "appVersion": "0.2.2",
             "transferMode": transferActive,
             "transferRole": transferRole,
             "logPath": logger.fileURL.path,
@@ -587,10 +587,12 @@ final class OpenMindmapLauncher: NSObject,
             return
         }
 
-        callBridgeAsync("window.__ommBridge.prepareNativeClose(\"\(reason.rawValue)\")", timeoutSeconds: 5.0) { [weak self, weak hostWindow] result in
+        let requestId = UUID().uuidString
+        callBridgeAsync("window.__ommBridge.prepareNativeClose(\"\(requestId)\")", timeoutSeconds: 5.0) { [weak self, weak hostWindow] result in
             guard let self else { completion(false); return }
             switch result {
             case .failure(let message):
+                self.cancelCloseAttempt(requestId)
                 self.logger.log("close.blocked.bridge_timeout_or_err", detail: "\(reason.rawValue): \(message)")
                 self.showBlockingAlert(
                     on: hostWindow,
@@ -603,8 +605,20 @@ final class OpenMindmapLauncher: NSObject,
                 let decision = dict["decision"] as? String ?? "error"
                 switch decision {
                 case "allow-clean":
-                    self.callBridgeAsync("window.__ommBridge.finalizeCleanClose()", timeoutSeconds: 3.0) { _ in
-                        completion(true)
+                    self.callBridgeAsync("window.__ommBridge.finalizeCleanClose(\"\(requestId)\")", timeoutSeconds: 6.0) { result in
+                        switch result {
+                        case .success(let dict) where (dict["ok"] as? Bool) == true:
+                            self.logCloseSessionWarning(dict)
+                            completion(true)
+                        case .success(let dict):
+                            self.showBlockingAlert(on: hostWindow, title: "Không thể hoàn tất đóng",
+                                message: dict["error"] as? String ?? "Không nhận được xác nhận lưu phiên.",
+                                style: .warning) { completion(false) }
+                        case .failure(let error):
+                            self.cancelCloseAttempt(requestId)
+                            self.showBlockingAlert(on: hostWindow, title: "Không thể hoàn tất đóng",
+                                message: error, style: .warning) { completion(false) }
+                        }
                     }
 
                 case "busy":
@@ -624,6 +638,7 @@ final class OpenMindmapLauncher: NSObject,
                     self.presentDirtyClosePrompt(
                         on: hostWindow,
                         projectName: proj,
+                        requestId: requestId,
                         reason: reason,
                         completion: completion
                     )
@@ -641,6 +656,7 @@ final class OpenMindmapLauncher: NSObject,
     private func presentDirtyClosePrompt(
         on hostWindow: NSWindow?,
         projectName: String,
+        requestId: String,
         reason: CloseReason,
         completion: @escaping (Bool) -> Void
     ) {
@@ -657,10 +673,11 @@ final class OpenMindmapLauncher: NSObject,
             guard let self else { completion(false); return }
             switch resp {
             case .alertFirstButtonReturn:
-                self.callBridgeAsync("window.__ommBridge.commitAndFlushBeforeClose()", timeoutSeconds: 8.0) { saveRes in
+                self.callBridgeAsync("window.__ommBridge.commitAndFlushBeforeClose(\"\(requestId)\")", timeoutSeconds: 8.0) { saveRes in
                     switch saveRes {
                     case .success(let dict) where (dict["ok"] as? Bool) == true:
                         self.logger.log("close.dirty.saved", detail: reason.rawValue)
+                        self.logCloseSessionWarning(dict)
                         completion(true)
                     case .success(let dict):
                         let errMsg = dict["error"] as? String ?? "Không thể lưu dự án trước khi đóng."
@@ -669,6 +686,7 @@ final class OpenMindmapLauncher: NSObject,
                             completion(false)
                         }
                     case .failure(let err):
+                        self.cancelCloseAttempt(requestId)
                         self.logger.log("close.dirty.save_timeout", detail: err)
                         self.showBlockingAlert(on: hostWindow, title: "Lưu thất bại", message: err, style: .critical) {
                             completion(false)
@@ -677,12 +695,14 @@ final class OpenMindmapLauncher: NSObject,
                 }
 
             case .alertSecondButtonReturn:
-                self.callBridgeAsync("window.__ommBridge.discardAndPrepareClose()", timeoutSeconds: 3.0) { discardRes in
+                self.callBridgeAsync("window.__ommBridge.discardAndPrepareClose(\"\(requestId)\")", timeoutSeconds: 8.0) { discardRes in
                     switch discardRes {
                     case .success(let dict) where (dict["ok"] as? Bool) == true:
                         self.logger.log("close.dirty.discarded", detail: reason.rawValue)
+                        self.logCloseSessionWarning(dict)
                         completion(true)
                     default:
+                        self.cancelCloseAttempt(requestId)
                         self.showBlockingAlert(
                             on: hostWindow,
                             title: "Không thể hủy thay đổi an toàn",
@@ -693,7 +713,7 @@ final class OpenMindmapLauncher: NSObject,
                 }
 
             default:
-                self.callBridgeAsync("window.__ommBridge.cancelNativeClose()", timeoutSeconds: 2.0) { _ in
+                self.callBridgeAsync("window.__ommBridge.cancelNativeClose(\"\(requestId)\")", timeoutSeconds: 2.0) { _ in
                     self.logger.log("close.dirty.cancelled", detail: reason.rawValue)
                     completion(false)
                 }
@@ -723,6 +743,16 @@ final class OpenMindmapLauncher: NSObject,
             NSApp.activate(ignoringOtherApps: true)
             handleChoice(alert.runModal())
         }
+    }
+
+    private func logCloseSessionWarning(_ result: [String: Any]) {
+        if let message = result["sessionWarning"] as? String {
+            logger.log("close.session_warning", detail: message)
+        }
+    }
+
+    private func cancelCloseAttempt(_ requestId: String) {
+        callBridgeAsync("window.__ommBridge.cancelNativeClose(\"\(requestId)\")", timeoutSeconds: 2.0) { _ in }
     }
 
     private enum BridgeCallResult {
@@ -912,6 +942,12 @@ final class OpenMindmapLauncher: NSObject,
 
         let action = dict["action"] as? String ?? ""
         if action == "exitTransferToApp" {
+            guard transferActive, let journal = try? transferStore.loadJournal(), journal.status == "completed",
+                  journal.transferId == dict["transferId"] as? String else {
+                replyTransfer(reqId: reqId, result: ["ok": false, "error": "Chưa xác nhận hoàn tất phiên chuyển dữ liệu."])
+                return
+            }
+            replyTransfer(reqId: reqId, result: ["ok": true])
             transferActive = false
             window?.title = "OpenMindmap"
             webView?.load(URLRequest(url: localURL, cachePolicy: .reloadIgnoringLocalCacheData))

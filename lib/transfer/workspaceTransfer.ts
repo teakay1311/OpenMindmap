@@ -1,3 +1,5 @@
+import { withStorageWrite } from '../storage/persistence'
+
 export const WORKSPACE_TRANSFER_FORMAT = 'openmindmap-workspace-transfer' as const
 export const WORKSPACE_TRANSFER_VERSION = 1 as const
 export const EXPECTED_LOCAL_ORIGIN = 'http://127.0.0.1:41735'
@@ -31,6 +33,14 @@ export interface WorkspaceTransferPackage {
   entries: WorkspaceTransferEntry[]
 }
 
+export interface TransferRollback {
+  keys: string[]
+  removeCleanShutdown: boolean
+  reason: string
+}
+
+type TransferKeyIntent = { transferId: string; key: string; sha256: string }
+
 export interface TransferJournalState {
   version: number
   transferId: string
@@ -42,6 +52,10 @@ export interface TransferJournalState {
   keyDigests: Record<string, string>
   totalKeys: number
   lastError?: string | null
+  rollbackPending?: TransferRollback
+  finalFlagOwned?: boolean
+  pendingKey?: TransferKeyIntent
+  blockedKey?: string
 }
 
 export interface StorageLike {
@@ -244,6 +258,7 @@ export type TransferErrorCode =
   | 'mismatch_in_progress'
   | 'resume_integrity_failed'
   | 'write_verify_failed'
+  | 'rollback_pending'
   | 'interrupted'
   | 'cancelled'
 
@@ -299,11 +314,18 @@ export async function validateTransferPackage(
   return { ok: true, pkg: { ...obj, cleanShutdown } as WorkspaceTransferPackage }
 }
 
+type JournalWriteResult = { ok: true } | { ok: false; error: string }
+
 export interface TransferJournalHooks {
-  beginOrResume: (packageSha256: string, totalKeys: number) => Promise<{ ok: true; mode: 'start' | 'resume'; journal: TransferJournalState } | { ok: false; code?: string; error: string }>
-  markKey: (key: string, sha256: string) => Promise<{ ok: true } | { ok: false; error: string }>
-  complete: () => Promise<{ ok: true } | { ok: false; error: string }>
-  rollback: (reason: string) => Promise<{ ok: true } | { ok: false; error: string }>
+  getState: () => Promise<TransferJournalState | null>
+  beginOrResume: (packageSha256: string, totalKeys: number, replaceLegacyId?: string) => Promise<JournalWriteResult>
+  blockIntent: (transferId: string, key: string) => Promise<JournalWriteResult>
+  prepareKey: (intent: TransferKeyIntent) => Promise<JournalWriteResult>
+  markKey: (intent: TransferKeyIntent) => Promise<JournalWriteResult>
+  prepareRollback: (transferId: string, pending: TransferRollback) => Promise<JournalWriteResult>
+  prepareFinalFlag: (transferId: string) => Promise<JournalWriteResult>
+  complete: (transferId: string) => Promise<JournalWriteResult>
+  rollback: (transferId: string, reason: string) => Promise<JournalWriteResult>
 }
 
 function writePriority(key: string): number {
@@ -324,6 +346,7 @@ export interface ImportTransferResult {
   writtenKeys: number
   resumedFromKeys: number
   rolledBackKeys?: number
+  verifiedComplete?: boolean
 }
 
 export async function importWorkspaceTransactional(
@@ -335,164 +358,220 @@ export async function importWorkspaceTransactional(
     shouldAbortBeforeKey?: (key: string, writtenInRun: number) => 'interrupt' | 'cancel' | false
   } = {}
 ): Promise<ImportTransferResult> {
-  return withOptionalWriteLock(async () => {
-    const startRes = await journal.beginOrResume(pkg.digestSha256, pkg.entries.length)
-    if (!startRes.ok) {
-      const code = (startRes.code === 'already_completed' || startRes.code === 'mismatch_in_progress')
-        ? startRes.code
-        : 'invalid_format'
-      return { ok: false, code, message: startRes.error, writtenKeys: 0, resumedFromKeys: 0 }
-    }
+  const failure = (code: TransferErrorCode, message: string): ImportTransferResult =>
+    ({ ok: false, code, message, writtenKeys: 0, resumedFromKeys: 0 })
+  const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error)
+  try {
+    return await withStorageWrite(async () => {
+      const cleanKey = 'omm.cleanShutdown'
+      const ordered = [...pkg.entries].sort((a, b) => writePriority(a.key) - writePriority(b.key) || a.key.localeCompare(b.key))
+      const matchesPackage = (state: TransferJournalState) =>
+        state.packageSha256 === pkg.digestSha256 && state.totalKeys === ordered.length
+      const matchesPrefix = (state: TransferJournalState) =>
+        Object.keys(state.keyDigests).length === state.completedKeys.length
+        && state.completedKeys.every((key, index) => {
+          const entry = ordered[index]
+          return key === entry?.key && state.keyDigests[key] === entry.sha256
+        })
+      const completeContents = () => ordered.every(entry => storage.getItem(entry.key) === entry.value)
+        && storage.getItem(cleanKey) === pkg.cleanShutdown
+        && listExistingWorkspaceKeys(storage).length === ordered.length + Number(pkg.cleanShutdown !== null)
 
-    const existingKeys = listExistingWorkspaceKeys(storage)
-    const entryMap = new Map(pkg.entries.map((e) => [e.key, e]))
-    const alreadyDone = new Set<string>(startRes.journal.completedKeys)
-
-    if (startRes.mode === 'start') {
-      if (existingKeys.length > 0) {
-        await journal.rollback('target_non_empty')
-        return {
-          ok: false,
-          code: 'non_empty_target',
-          message: `Ứng dụng đích đã có ${existingKeys.length} khóa dữ liệu (${existingKeys.slice(0, 3).join(', ')}…). Từ chối ghi đè âm thầm.`,
-          writtenKeys: 0,
-          resumedFromKeys: 0,
+      let state = await journal.getState()
+      if (state?.status === 'completed') {
+        const verifiedComplete = matchesPackage(state) && matchesPrefix(state)
+          && !state.blockedKey && !state.pendingKey && !state.rollbackPending && state.completedKeys.length === ordered.length && completeContents()
+        return { ...failure('already_completed', verifiedComplete
+          ? 'Gói này đã chuyển xong và dữ liệu được xác minh.'
+          : 'Đã có phiên chuyển hoàn tất. Dữ liệu hiện tại không khớp gói này.'), verifiedComplete }
+      }
+      if (state?.status === 'in_progress' && !matchesPackage(state)) {
+        return failure('mismatch_in_progress', 'Đang có tiến trình chuyển dữ liệu cho gói khác.')
+      }
+      if (state?.status === 'in_progress' && state.version === 1
+        && (state.completedKeys.length || Object.keys(state.keyDigests).length
+          || state.rollbackPending || state.finalFlagOwned || state.pendingKey || state.blockedKey || listExistingWorkspaceKeys(storage).length)) {
+        return failure('resume_integrity_failed', 'Journal cũ không đủ thông tin để xác minh quyền ghi. Dữ liệu được giữ nguyên.')
+      }
+      if (!state || state.status === 'rolled_back' || state.version === 1) {
+        if (listExistingWorkspaceKeys(storage).length) {
+          return failure('non_empty_target', 'Ứng dụng đích đã có dữ liệu. Từ chối ghi đè.')
+        }
+        const previousId = state?.transferId
+        await journal.beginOrResume(pkg.digestSha256, ordered.length, state?.status === 'in_progress' ? previousId : undefined)
+          .catch(() => undefined)
+        state = await journal.getState()
+        if (!state || state.transferId === previousId || state.completedKeys.length || state.pendingKey
+          || state.rollbackPending || state.finalFlagOwned || state.blockedKey) {
+          return failure('interrupted', 'Chưa xác nhận được journal mới. Hãy thử lại với cùng gói.')
         }
       }
-    } else {
-      // Resume mode: verify every previously completed key still matches package SHA-256
-      for (const doneKey of alreadyDone) {
-        const expected = entryMap.get(doneKey)
-        const current = storage.getItem(doneKey)
-        if (!expected || current === null || (await sha256Hex(current)) !== expected.sha256) {
-          return {
-            ok: false,
-            code: 'resume_integrity_failed',
-            message: `Dữ liệu đã ghi trước đó tại khóa ${doneKey} bị thay đổi hoặc thiếu; không thể tiếp tục tự động.`,
-            writtenKeys: 0,
-            resumedFromKeys: 0,
+      if (state.version !== 2 || state.status !== 'in_progress' || !matchesPackage(state) || !matchesPrefix(state)) {
+        return failure('resume_integrity_failed', 'Journal không khớp với tiến trình chuyển.')
+      }
+      if (state.blockedKey) return failure('non_empty_target', 'Phát hiện dữ liệu có sẵn tại ' + state.blockedKey + '. Dữ liệu được giữ nguyên.')
+      const transferId = state.transferId
+      const readState = async () => {
+        const latest = await journal.getState()
+        if (!latest || latest.version !== 2 || latest.transferId !== transferId || !matchesPackage(latest) || !matchesPrefix(latest)) {
+          throw new Error('Không xác minh được journal của phiên chuyển.')
+        }
+        return latest
+      }
+      const matchesIntent = (intent: TransferKeyIntent | undefined, entry: WorkspaceTransferEntry | undefined) =>
+        !!intent && !!entry && intent.transferId === transferId && intent.key === entry.key && intent.sha256 === entry.sha256
+      const ownedKeys = (current: TransferJournalState) => [
+        ...current.completedKeys, ...(current.pendingKey ? [current.pendingKey.key] : []),
+      ]
+      const flagOwned = (current: TransferJournalState) => current.finalFlagOwned === true
+        && pkg.cleanShutdown !== null && current.completedKeys.length === ordered.length && !current.pendingKey
+
+      const finishRollback = async (current: TransferJournalState, pending: TransferRollback): Promise<ImportTransferResult> => {
+        try {
+          const keys = ownedKeys(current)
+          if (pending.keys.length !== keys.length || pending.keys.some((key, index) => key !== keys[index])
+            || pending.removeCleanShutdown !== flagOwned(current)) throw new Error('Phạm vi hoàn tác không khớp journal.')
+          const entries = ordered.slice(0, keys.length).reverse()
+          for (const entry of entries) {
+            const value = storage.getItem(entry.key)
+            if (value !== null && value !== entry.value) throw new Error('Dữ liệu đã đổi tại ' + entry.key)
           }
-        }
-      }
-      for (const curKey of existingKeys) {
-        if (curKey !== 'omm.cleanShutdown' && !alreadyDone.has(curKey)) {
-          return {
-            ok: false,
-            code: 'non_empty_target',
-            message: `Phát hiện khóa ngoài phiên chuyển (${curKey}) trên máy đích.`,
-            writtenKeys: 0,
-            resumedFromKeys: 0,
+          const flag = storage.getItem(cleanKey)
+          if (pending.removeCleanShutdown && flag !== null && flag !== pkg.cleanShutdown) throw new Error('Cờ phiên đã thay đổi.')
+          for (const entry of entries) {
+            if (storage.getItem(entry.key) === entry.value) storage.removeItem(entry.key)
+            if (storage.getItem(entry.key) !== null) throw new Error('Không xác thực được hoàn tác ' + entry.key)
           }
+          if (pending.removeCleanShutdown && flag !== null) {
+            storage.removeItem(cleanKey)
+            if (storage.getItem(cleanKey) !== null) throw new Error('Không xác thực được việc hoàn tác cờ phiên.')
+          }
+          await journal.rollback(transferId, pending.reason).catch(() => undefined)
+          const latest = await readState()
+          if (latest.status !== 'rolled_back' || latest.rollbackPending) throw new Error('Chưa xác nhận được journal đã hoàn tác.')
+          const cancelled = pending.reason === 'user_cancelled'
+          return { ...failure(cancelled ? 'cancelled' : 'write_verify_failed',
+            cancelled ? 'Đã hủy chuyển dữ liệu và hoàn tác sạch các khóa đã ghi.'
+              : 'Đã hoàn tác chuyển dữ liệu (' + pending.reason + '). Hãy thử lại với cùng gói.'),
+            rolledBackKeys: entries.length }
+        } catch (error) {
+          return failure('rollback_pending', 'Chưa hoàn tác xong: ' + messageOf(error) + ' Hãy tiếp tục với cùng gói.')
         }
       }
-    }
-
-    const ordered = [...pkg.entries].sort((a, b) => writePriority(a.key) - writePriority(b.key) || a.key.localeCompare(b.key))
-    const writtenSnapshots = new Map<string, string>()
-
-    const performRollback = async (reason: string): Promise<number> => {
-      let removed = 0
-      const candidates = new Set([...alreadyDone, ...writtenSnapshots.keys()])
-      for (const key of candidates) {
-        const expected = writtenSnapshots.get(key) ?? entryMap.get(key)?.value
-        if (expected !== undefined && storage.getItem(key) === expected) {
-          storage.removeItem(key)
-          removed++
-        }
-      }
-      if (storage.getItem('omm.cleanShutdown') === pkg.cleanShutdown && pkg.cleanShutdown !== null) {
-        storage.removeItem('omm.cleanShutdown')
-      }
-      await journal.rollback(reason)
-      return removed
-    }
-
-    let writtenInRun = 0
-    for (let i = 0; i < ordered.length; i++) {
-      const entry = ordered[i]
-      if (alreadyDone.has(entry.key)) continue
-
-      const abortReason = options.shouldAbortBeforeKey?.(entry.key, writtenInRun)
-      if (abortReason === 'interrupt') {
-        return {
-          ok: false,
-          code: 'interrupted',
-          message: `Phiên chuyển dữ liệu tạm dừng trước khóa ${entry.key} (giữ journal để tiếp tục).`,
-          writtenKeys: writtenInRun,
-          resumedFromKeys: alreadyDone.size,
-        }
-      }
-      if (abortReason === 'cancel') {
-        const removed = await performRollback('user_cancelled')
-        return {
-          ok: false,
-          code: 'cancelled',
-          message: 'Đã hủy chuyển dữ liệu và hoàn tác sạch các khóa đã ghi.',
-          writtenKeys: 0,
-          resumedFromKeys: 0,
-          rolledBackKeys: removed,
+      const validActiveState = (current: TransferJournalState) => current.status === 'in_progress' && !current.blockedKey
+        && (!current.pendingKey || matchesIntent(current.pendingKey, ordered[current.completedKeys.length]))
+        && (!current.finalFlagOwned || flagOwned(current))
+      const requestRollback = async (reason: string): Promise<ImportTransferResult> => {
+        try {
+          const latest = await readState()
+          if (!validActiveState(latest)) throw new Error('Journal không ở trạng thái có thể hoàn tác.')
+          const pending = { keys: ownedKeys(latest), removeCleanShutdown: flagOwned(latest), reason }
+          await journal.prepareRollback(transferId, pending).catch(() => undefined)
+          const prepared = await readState()
+          if (!validActiveState(prepared) || prepared.rollbackPending?.reason !== reason) {
+            throw new Error('Chưa xác nhận được ý định hoàn tác trong journal.')
+          }
+          return await finishRollback(prepared, prepared.rollbackPending)
+        } catch (error) {
+          return failure('rollback_pending', reason + '. Chưa hoàn tác: ' + messageOf(error) + ' Hãy tiếp tục với cùng gói.')
         }
       }
 
-      try {
-        storage.setItem(entry.key, entry.value)
-        const readBack = storage.getItem(entry.key)
-        if (readBack !== entry.value || (await sha256Hex(readBack)) !== entry.sha256) {
-          throw new Error(`Xác minh đọc lại thất bại tại ${entry.key}`)
-        }
-        writtenSnapshots.set(entry.key, entry.value)
-        const mark = await journal.markKey(entry.key, entry.sha256)
-        if (!mark.ok) throw new Error(mark.error)
-        writtenInRun++
-        options.onProgress?.(alreadyDone.size + writtenInRun, ordered.length, entry.key)
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e)
-        const removed = await performRollback(msg)
-        return {
-          ok: false,
-          code: 'write_verify_failed',
-          message: `Chuyển dữ liệu thất bại và đã hoàn tác (${msg}).`,
-          writtenKeys: 0,
-          resumedFromKeys: 0,
-          rolledBackKeys: removed,
+      if (!validActiveState(state)) return failure('resume_integrity_failed', 'Ý định ghi trong journal không hợp lệ.')
+      if (state.rollbackPending) return finishRollback(state, state.rollbackPending)
+      const owned = new Set(ownedKeys(state))
+      for (const entry of ordered.slice(0, state.completedKeys.length)) {
+        if (storage.getItem(entry.key) !== entry.value) {
+          return failure('resume_integrity_failed', 'Dữ liệu đã ghi bị thay đổi hoặc thiếu tại ' + entry.key)
         }
       }
-    }
+      const pendingEntry = state.pendingKey ? ordered[state.completedKeys.length] : undefined
+      if (listExistingWorkspaceKeys(storage).some(key => key !== cleanKey && !owned.has(key))
+        || (pendingEntry && storage.getItem(pendingEntry.key) !== null && storage.getItem(pendingEntry.key) !== pendingEntry.value)) {
+        return failure('non_empty_target', 'Phát hiện dữ liệu ngoài phiên chuyển hoặc đã thay đổi.')
+      }
+      const initialFlag = storage.getItem(cleanKey)
+      if (initialFlag !== null && (!flagOwned(state) || initialFlag !== pkg.cleanShutdown)) {
+        return failure('non_empty_target', 'Cờ phiên không thuộc tiến trình chuyển.')
+      }
 
-    // Preserve exact cleanShutdown flag ('1' or absent) only after every data key verified
-    if (pkg.cleanShutdown !== null) {
-      storage.setItem('omm.cleanShutdown', pkg.cleanShutdown)
-      if (storage.getItem('omm.cleanShutdown') !== pkg.cleanShutdown) {
-        const removed = await performRollback('cleanShutdown_verify_failed')
-        return {
-          ok: false,
-          code: 'write_verify_failed',
-          message: 'Không xác minh được cờ cleanShutdown; đã hoàn tác.',
-          writtenKeys: 0,
-          resumedFromKeys: 0,
-          rolledBackKeys: removed,
+      async function blockUnexpectedWrite(key: string) {
+        await journal.blockIntent(transferId, key).catch(() => undefined)
+        const blocked = await readState()
+        if (blocked.blockedKey !== key) throw new Error('Chưa làm rõ được nguồn dữ liệu tại ' + key)
+        return failure('non_empty_target', 'Dữ liệu có sẵn được giữ nguyên tại ' + key)
+      }
+
+      const resumedFromKeys = state.completedKeys.length + Number(!!pendingEntry && storage.getItem(pendingEntry.key) !== null)
+      let writtenInRun = 0
+      for (const [index, entry] of ordered.entries()) {
+        if (index < state.completedKeys.length) continue
+        const abort = options.shouldAbortBeforeKey?.(entry.key, writtenInRun)
+        if (abort === 'interrupt') {
+          return { ...failure('interrupted', 'Phiên chuyển dữ liệu tạm dừng trước khóa ' + entry.key), writtenKeys: writtenInRun, resumedFromKeys }
         }
-      }
-    } else {
-      storage.removeItem('omm.cleanShutdown')
-    }
+        if (abort === 'cancel') return requestRollback('user_cancelled')
 
-    const doneRes = await journal.complete()
-    if (!doneRes.ok) {
-      return {
-        ok: false,
-        code: 'write_verify_failed',
-        message: `Dữ liệu đã ghi nhưng không hoàn tất được journal: ${doneRes.error}`,
-        writtenKeys: writtenInRun,
-        resumedFromKeys: alreadyDone.size,
-      }
-    }
+        const intent = { transferId, key: entry.key, sha256: entry.sha256 }
+        if (!state.pendingKey) {
+          if (storage.getItem(entry.key) !== null) {
+            return failure('non_empty_target', 'Dữ liệu đã xuất hiện tại ' + entry.key)
+          }
+          await journal.prepareKey(intent).catch(() => undefined)
+          state = await readState()
+          if (!validActiveState(state) || state.rollbackPending || state.completedKeys.length !== index
+            || !matchesIntent(state.pendingKey, entry)) {
+            return failure('interrupted', 'Chưa xác nhận được ý định ghi. Hãy thử lại với cùng gói.')
+          }
+          if (storage.getItem(entry.key) !== null) return blockUnexpectedWrite(entry.key)
+        }
+        const current = storage.getItem(entry.key)
+        if (current !== null && current !== entry.value) {
+          return failure('non_empty_target', 'Dữ liệu đã thay đổi tại ' + entry.key)
+        }
+        try {
+          if (current === null) {
+            storage.setItem(entry.key, entry.value)
+            writtenInRun++
+          }
+          const readBack = storage.getItem(entry.key)
+          if (readBack !== entry.value || (await sha256Hex(readBack)) !== entry.sha256) {
+            throw new Error('Xác minh đọc lại thất bại tại ' + entry.key)
+          }
+        } catch (error) { return requestRollback(messageOf(error)) }
 
-    return {
-      ok: true,
-      message: `Đã chuyển và xác minh ${ordered.length} khóa dữ liệu sang OpenMindmap macOS.`,
-      writtenKeys: writtenInRun,
-      resumedFromKeys: alreadyDone.size,
-    }
-  })
+        await journal.markKey(intent).catch(() => undefined)
+        state = await readState()
+        if (!validActiveState(state) || state.rollbackPending || state.pendingKey || state.completedKeys.length !== index + 1) {
+          return failure('interrupted', 'Chưa xác nhận được khóa đã ghi. Hãy thử lại với cùng gói.')
+        }
+        options.onProgress?.(index + 1, ordered.length, entry.key)
+      }
+
+      if (pkg.cleanShutdown !== null && storage.getItem(cleanKey) === null) {
+        if (!flagOwned(state)) {
+          await journal.prepareFinalFlag(transferId).catch(() => undefined)
+          state = await readState()
+          if (!validActiveState(state) || state.rollbackPending || !flagOwned(state)) {
+            return failure('interrupted', 'Chưa xác nhận được ý định ghi cờ phiên.')
+          }
+          if (storage.getItem(cleanKey) !== null) return blockUnexpectedWrite(cleanKey)
+        }
+        try {
+          storage.setItem(cleanKey, pkg.cleanShutdown)
+          if (storage.getItem(cleanKey) !== pkg.cleanShutdown) throw new Error('Không xác minh được việc ghi cờ phiên.')
+        } catch (error) { return requestRollback(messageOf(error)) }
+      }
+      if (!completeContents()) return failure('resume_integrity_failed', 'Dữ liệu đích đã thay đổi trước khi hoàn tất.')
+      await journal.complete(transferId).catch(() => undefined)
+      state = await readState()
+      if (state.status === 'completed' && completeContents()) {
+        return { ok: true, message: 'Đã chuyển và xác minh ' + ordered.length + ' khóa dữ liệu sang OpenMindmap macOS.',
+          writtenKeys: writtenInRun, resumedFromKeys }
+      }
+      return failure('interrupted', 'Chưa xác nhận được việc hoàn tất chuyển dữ liệu. Hãy thử lại với cùng gói.')
+    })
+  } catch (error) {
+    return failure('resume_integrity_failed', 'Chưa xác nhận được việc chuyển dữ liệu: ' + messageOf(error))
+  }
 }

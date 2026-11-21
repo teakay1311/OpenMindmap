@@ -53,11 +53,11 @@ declare global {
       viewSession: string
       getState: () => MenuStateSnapshot
       executeCommand: (req: ExecuteCommandRequest) => ExecuteCommandResult
-      prepareNativeClose: (reason: 'window-close' | 'app-quit') => ReturnType<typeof inspectNativeCloseState>
-      finalizeCleanClose: () => ReturnType<typeof finalizeNativeCleanClose>
-      commitAndFlushBeforeClose: () => ReturnType<typeof commitAndFlushNativeClose>
-      discardAndPrepareClose: () => ReturnType<typeof discardAndPrepareNativeClose>
-      cancelNativeClose: () => ReturnType<typeof cancelNativeClose>
+      prepareNativeClose: (requestId: string) => ReturnType<typeof inspectNativeCloseState>
+      finalizeCleanClose: (requestId: string) => ReturnType<typeof finalizeNativeCleanClose>
+      commitAndFlushBeforeClose: (requestId: string) => ReturnType<typeof commitAndFlushNativeClose>
+      discardAndPrepareClose: (requestId: string) => ReturnType<typeof discardAndPrepareNativeClose>
+      cancelNativeClose: (requestId: string) => ReturnType<typeof cancelNativeClose>
     }
     __ommResolveNativeDownload?: (res: { id: string; ok: boolean; cancelled?: boolean; path?: string | null; error?: string | null }) => void
   }
@@ -143,16 +143,16 @@ export function mountNativeBridge(): () => void {
       const nextSnap = pushMenuState(true)
       return { ok: true, handled: true, generation: useApp.getState().generation, state: nextSnap }
     },
-    prepareNativeClose: () => {
-      const decision = inspectNativeCloseState()
+    prepareNativeClose: requestId => {
+      const decision = inspectNativeCloseState(requestId)
       pushMenuState(true)
       return decision
     },
-    finalizeCleanClose: () => finalizeNativeCleanClose(),
-    commitAndFlushBeforeClose: () => commitAndFlushNativeClose(),
-    discardAndPrepareClose: () => discardAndPrepareNativeClose(),
-    cancelNativeClose: () => {
-      const res = cancelNativeClose()
+    finalizeCleanClose: requestId => finalizeNativeCleanClose(requestId),
+    commitAndFlushBeforeClose: requestId => commitAndFlushNativeClose(requestId),
+    discardAndPrepareClose: requestId => discardAndPrepareNativeClose(requestId),
+    cancelNativeClose: requestId => {
+      const res = cancelNativeClose(requestId)
       pushMenuState(true)
       return res
     },

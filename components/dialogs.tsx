@@ -708,11 +708,7 @@ export function SettingsDialog() {
   )
 }
 
-/* ================= Thùng rác (PR05 Delete-to-Trash — hoàn thiện lối vào) =================
- * deleteProject đã ghi vào omm.trash.v3 từ trước nhưng không có UI xem/phục hồi.
- * Dialog này chỉ đọc/ghi qua các hàm storage đã có: trashList / removeFromTrash /
- * saveProjectAtomic / upsertMeta. Khôi phục: giữ ID gốc nếu trống, còn tồn tại thì
- * tạo bản sao ID mới (tái dùng pattern resolveConflictSaveAs). */
+/* ================= Thùng rác (PR05) ================= */
 export function TrashDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   // Đọc trashList() trực tiếp lúc render (không setState trong effect);
   // refresh sau restore/purge bằng counter.
@@ -720,11 +716,11 @@ export function TrashDialog({ open, onClose }: { open: boolean; onClose: () => v
   if (!open) return null
   const items = trashList()
   const restore = async (item: TrashItem) => {
-    if (await useApp.getState().restoreTrash(item.id)) force(n => n + 1)
+    if (await useApp.getState().restoreTrash(item)) force(n => n + 1)
   }
   const purge = (item: TrashItem) => {
     useApp.getState().setConfirm({ message: `Xóa vĩnh viễn "${item.name}" khỏi thùng rác?`, detail: 'Không thể hoàn tác.', danger: true,
-      onOk: async () => { const ok = await useApp.getState().purgeTrash(item.id); if (ok) force(n => n + 1); return ok },
+      onOk: async () => { const ok = await useApp.getState().purgeTrash(item); if (ok) force(n => n + 1); return ok },
     })
   }
   return (

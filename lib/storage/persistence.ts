@@ -1,5 +1,5 @@
-import { ProjectDocV3 } from '../core/types'
-import { loadRegistry, metaFromDoc, upsertMeta, saveProjectAtomic, loadSettings, saveSettings, pushBackup, readStoredProject, trashList, STORAGE_KEYS } from './projects'
+import { uuid, ProjectDocV3 } from '../core/types'
+import { loadRegistry, metaFromDoc, upsertMeta, saveProjectAtomic, loadSettings, saveSettings, pushBackup, readStoredProject, trashList, isTrashRestorePending, STORAGE_KEYS } from './projects'
 
 export type WriteResult =
   | { kind: 'saved'; raw: string }
@@ -34,7 +34,7 @@ export function sameCanonicalProject(a: ProjectDocV3, b: ProjectDocV3, ignoreUpd
 }
 
 export function inspectNativeImportId(doc: ProjectDocV3, options: { ignoreUpdatedAt?: boolean } = {}): NativeCollisionCheck {
-  if (trashList().some((item) => item.id === doc.project_id)) {
+  if (trashList().some((item) => item.id === doc.project_id || item.restoreId === doc.project_id)) {
     return {
       kind: 'collision',
       reason: 'in_trash',
@@ -97,9 +97,10 @@ export async function withStorageWrite<T>(write: () => T | Promise<T>): Promise<
   } finally { clearTimeout(timer) }
 }
 
-function writeAndVerifyMetadata(doc: ProjectDocV3, activate: boolean, setStage: (s: string) => void) {
+export function writeAndVerifyMetadata(doc: ProjectDocV3, activate: boolean, setStage: (s: string) => void, opened = activate) {
   setStage('cập nhật danh sách dự án')
-  const expectedMeta = metaFromDoc(doc, loadRegistry().find(m => m.id === doc.project_id))
+  const expectedMeta = metaFromDoc(doc, loadRegistry().find(m => m.id === doc.project_id), opened)
+  if (activate && expectedMeta.storageEpoch === undefined) expectedMeta.storageEpoch = uuid()
   upsertMeta(expectedMeta)
   const meta = loadRegistry().find(m => m.id === doc.project_id)
   if (JSON.stringify(meta) !== JSON.stringify(expectedMeta)) throw new Error('Xác thực danh sách dự án thất bại')
@@ -128,7 +129,7 @@ export async function commitNativeOpen(
       if (verifiedRaw !== undefined) {
         stage = 'xác minh lại bản đã ghi'
         const current = projectRaw(doc.project_id)
-        const inTrash = trashList().some((item) => item.id === doc.project_id)
+        const inTrash = trashList().some((item) => item.id === doc.project_id || item.restoreId === doc.project_id)
         if (inTrash || current !== verifiedRaw) {
           return {
             kind: 'conflict' as const,
@@ -167,25 +168,44 @@ export async function commitNativeOpen(
 }
 
 /** Caller retains writtenRaw even when a subsequent metadata write fails. */
-export async function persistProject(doc: ProjectDocV3, expected: string | null, options: { activate?: boolean; backupCount?: number } = {}): Promise<WriteResult> {
-  let writtenRaw: string | undefined
-  let stage = 'lấy khóa ghi'
+type PersistOptions = {
+  activate?: boolean
+  opened?: boolean
+  backupCount?: number
+  identity?: { storageEpoch?: string }
+  afterSave?: () => void
+  beforeSave?: () => void
+}
+
+export async function persistProject(doc: ProjectDocV3, expected: string | null, options: PersistOptions = {}): Promise<WriteResult> {
   try {
-    return await withStorageWrite(() => {
-      stage = 'kiểm tra bản nền'
-      const raw = JSON.stringify(doc)
-      const current = projectRaw(doc.project_id)
-      if (current !== expected && current !== raw) return { kind: 'conflict' as const, message: 'Dự án đã bị thay đổi hoặc xóa ở tab khác. Hãy Tải lại hoặc Lưu thành.' }
-      if (raw !== current) {
-        if (options.backupCount !== undefined) pushBackup(doc, options.backupCount)
-        stage = 'ghi và xác thực dự án'
-        const result = saveProjectAtomic(doc)
-        if (!result.ok) throw new Error(result.error)
-      }
-      writtenRaw = raw
-      writeAndVerifyMetadata(doc, !!options.activate, (s) => { stage = s })
-      return { kind: 'saved' as const, raw }
-    })
+    return await withStorageWrite(() => persistProjectLocked(doc, expected, options))
+  } catch (e) {
+    return { kind: 'error', message: `Không thể lấy khóa ghi: ${e instanceof Error ? e.message : String(e)}` }
+  }
+}
+
+/** Called inside the shared write lock when storage and another record must change together. */
+export function persistProjectLocked(doc: ProjectDocV3, expected: string | null, options: PersistOptions = {}): WriteResult {
+  let writtenRaw: string | undefined
+  let stage = 'kiểm tra bản nền'
+  try {
+    options.beforeSave?.()
+    const raw = JSON.stringify(doc)
+    const current = projectRaw(doc.project_id)
+    const currentEpoch = loadRegistry().find(item => item.id === doc.project_id)?.storageEpoch
+    if (isTrashRestorePending(doc.project_id, currentEpoch)
+      || (options.identity && currentEpoch !== options.identity.storageEpoch) || (current !== expected && current !== raw)) return { kind: 'conflict' as const, message: 'Dự án đã bị thay đổi hoặc xóa ở tab khác. Hãy Tải lại hoặc Lưu thành.' }
+    if (raw !== current) {
+      if (options.backupCount !== undefined) pushBackup(doc, options.backupCount)
+      stage = 'ghi và xác thực dự án'
+      const result = saveProjectAtomic(doc)
+      if (!result.ok) throw new Error(result.error)
+    }
+    writtenRaw = raw
+    writeAndVerifyMetadata(doc, !!options.activate, (s) => { stage = s }, options.opened)
+    options.afterSave?.()
+    return { kind: 'saved' as const, raw }
   } catch (e) {
     return { kind: 'error', message: `Không thể ${stage}: ${e instanceof Error ? e.message : String(e)}`, writtenRaw }
   }

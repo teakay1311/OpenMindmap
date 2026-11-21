@@ -27,10 +27,13 @@ export interface ProjectMeta {
   revision: number
   lastOpened: string
   nodeCount: number
+  recentHidden?: boolean
+  storageEpoch?: string
 }
 
 export interface DraftJournalRecord {
   journal_schema_version: 1
+  editor_session_id?: string
   project_id: string
   node_id: string
   field: 'title' | 'notes'
@@ -60,30 +63,87 @@ export function upsertMeta(meta: ProjectMeta) {
 export function removeMeta(id: string) {
   saveRegistry(loadRegistry().filter((m) => m.id !== id))
 }
-export function metaFromDoc(doc: ProjectDocV3, prev?: ProjectMeta): ProjectMeta {
+export function recentProjects(registry: ProjectMeta[]): ProjectMeta[] {
+  return registry.filter(meta => !meta.recentHidden)
+}
+
+export function metaFromDoc(doc: ProjectDocV3, prev?: ProjectMeta, opened = true): ProjectMeta {
   return {
     id: doc.project_id,
     name: doc.name,
     createdAt: prev?.createdAt ?? doc.created_at,
     updatedAt: doc.updated_at,
     revision: doc.document_revision,
-    lastOpened: new Date().toISOString(),
+    lastOpened: !opened && prev?.recentHidden ? prev.lastOpened : new Date().toISOString(),
     nodeCount: doc.topics.length,
+    ...(!opened && prev?.recentHidden ? { recentHidden: true } : {}),
+    ...(prev ? (prev.storageEpoch ? { storageEpoch: prev.storageEpoch } : {}) : { storageEpoch: uuid() }),
   }
 }
 
 /* ---------- Trash (Delete to Trash — PR05) ---------- */
-export interface TrashItem { id: string; name: string; deletedAt: string; doc: ProjectDocV3 }
+export interface TrashItem {
+  id: string
+  name: string
+  deletedAt: string
+  doc: ProjectDocV3
+  deletionId?: string
+  sourceStorageEpoch?: string | null
+  restoreId?: string
+  restoreEpoch?: string
+  restorePrepared?: true
+}
+export function isSameTrashItem(current: TrashItem | undefined, expected: TrashItem): current is TrashItem {
+  return !!current && current.id === expected.id && current.deletionId === expected.deletionId && current.deletedAt === expected.deletedAt
+    && JSON.stringify(current.doc) === JSON.stringify(expected.doc)
+}
 export function trashList(): TrashItem[] { return safeParse<TrashItem[]>(localStorage.getItem(K.trash), []) }
-export function pushTrash(doc: ProjectDocV3) {
-  const list = trashList().filter(item => item.id !== doc.project_id)
-  list.unshift({ id: doc.project_id, name: doc.name, deletedAt: new Date().toISOString(), doc })
-  localStorage.setItem(K.trash, JSON.stringify(list.slice(0, 50)))
+export function isTrashRestorePending(id: string, storageEpoch?: string): boolean {
+  const raw = localStorage.getItem(K.trash)
+  if (!raw?.includes(JSON.stringify(id))) return false
+  return safeParse<TrashItem[]>(raw, []).some(item => item.restoreId === id && item.restoreEpoch
+    && (!item.restorePrepared || item.restoreEpoch !== storageEpoch))
+}
+
+export function pushTrash(doc: ProjectDocV3, retired: readonly TrashItem[] = [], sourceStorageEpoch?: string | null): TrashItem {
+  const previous = localStorage.getItem(K.trash)
+  const entries = previous === null ? [] : JSON.parse(previous) as TrashItem[]
+  if (!Array.isArray(entries)) throw new Error('Không đọc được danh sách thùng rác.')
+  const item = { id: doc.project_id, name: doc.name, deletedAt: new Date().toISOString(), deletionId: uuid(), sourceStorageEpoch, doc }
+  const list = [item, ...entries.filter(entry => entry.id !== doc.project_id && !retired.some(old => isSameTrashItem(entry, old)))]
+  if (list.length > 50) {
+    const registry = loadRegistry()
+    const canEvict = (entry: TrashItem) => {
+      const { restoreId, restoreEpoch } = entry
+      return !restoreId || (!!restoreEpoch && entry.restorePrepared === true
+        && registry.some(meta => meta.id === restoreId && meta.storageEpoch === restoreEpoch)
+        && readStoredProject(localStorage.getItem(K.project(restoreId)), restoreId) !== null)
+    }
+    for (let index = list.length - 1; list.length > 50 && index > 0; index--) {
+      if (canEvict(list[index])) list.splice(index, 1)
+    }
+    if (list.length > 50) throw new Error('Thùng rác đã đầy. Hãy hoàn tất các lượt khôi phục đang dở trước khi chuyển thêm dự án.')
+  }
+
+  const expected = JSON.stringify(list)
+  localStorage.setItem(K.trash, expected)
+  try {
+    if (localStorage.getItem(K.trash) !== expected) throw new Error('Không xác thực được danh sách thùng rác.')
+  } catch (error) {
+    // Keep the source document until the entire trash list, including restore markers, is verified.
+    try {
+      if (previous === null) localStorage.removeItem(K.trash)
+      else localStorage.setItem(K.trash, previous)
+      if (localStorage.getItem(K.trash) !== previous) throw new Error('Không xác thực được danh sách thùng rác trước đó.')
+    } catch { throw new Error('Không xác thực được danh sách thùng rác trước đó. Tài liệu gốc vẫn được giữ.') }
+    throw error
+  }
+  return item
 }
 export function removeFromTrash(id: string) {
   saveTrashList(trashList().filter((t) => t.id !== id))
 }
-function saveTrashList(list: TrashItem[]) {
+export function saveTrashList(list: TrashItem[]) {
   localStorage.setItem(K.trash, JSON.stringify(list))
 }
 
@@ -246,9 +306,11 @@ export function watchProjectConflict(projectId: string, onExternalWrite: (raw: s
 }
 
 /* ---------- Session viewport per project (AppSettings.session_by_project) ---------- */
-export interface SessionView { camera: { x: number; y: number; zoom: number }; sidebar?: string }
+export interface SessionView { camera: { x: number; y: number; zoom: number }; sidebar?: string; storageEpoch?: string }
 export function saveSession(projectId: string, view: SessionView) {
-  try { localStorage.setItem(K.session(projectId), JSON.stringify(view)) } catch { /* ignore */ }
+  const raw = JSON.stringify(view)
+  localStorage.setItem(K.session(projectId), raw)
+  if (localStorage.getItem(K.session(projectId)) !== raw) throw new Error('Không xác thực được vị trí canvas.')
 }
 export function loadSession(projectId: string): SessionView | null {
   return safeParse<SessionView | null>(localStorage.getItem(K.session(projectId)), null)

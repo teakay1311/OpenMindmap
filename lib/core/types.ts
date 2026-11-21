@@ -481,7 +481,7 @@ export function parseProjectJSON(jsonText: string): ParseResult {
     theme_id: getTheme(typeof data.theme_id === 'string' ? data.theme_id : '').id,
     map_style_overrides: (data.map_style_overrides ?? {}) as ProjectDocV3['map_style_overrides'],
     role_style_defaults: (data.role_style_defaults ?? {}) as ProjectDocV3['role_style_defaults'],
-    version_note: null,
+    version_note: typeof data.version_note === 'string' ? data.version_note : null,
   }
   assertValidImportedProject(doc)
   if (sv < 3) warnings.push(`Đã chuyển đổi schema v${sv} → v3. Tệp nguồn không bị sửa; bản chuyển đổi chỉ ghi khi Lưu/Xác nhận.`)

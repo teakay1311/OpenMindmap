@@ -6,7 +6,6 @@
  * Preview/ghost chỉ nằm RAM (LOCK-05).
  * ============================================================ */
 'use client'
-import { loadSession } from '../lib/storage/projects'
 import { readImage } from '../lib/io/images'
 import { BranchClipboard, pasteBranch } from '../lib/core/clipboard'
 
@@ -207,6 +206,7 @@ const IDLE: Interaction = {
 
 export function CanvasView() {
   const doc = useApp((s) => s.doc)
+  const cameraReady = useApp((s) => s.cameraReady)
   const camera = useApp((s) => s.camera)
   const setCamera = useApp((s) => s.setCamera)
   const selection = useApp((s) => s.selection)
@@ -604,9 +604,8 @@ export function CanvasView() {
   useEffect(() => {
     if (fittedRef.current === generation || !doc || !scene2?.nodes.length || !wrapRef.current?.clientWidth || !wrapRef.current.clientHeight) return
     fittedRef.current = generation
-    const session = loadSession(doc.project_id)?.camera
-    if (!session || ![session.x, session.y, session.zoom].every(Number.isFinite) || session.zoom < 0.1 || session.zoom > 4) fitAll()
-  }, [doc, scene2, generation, fitAll])
+    if (!cameraReady) fitAll()
+  }, [doc, scene2, generation, cameraReady, fitAll])
 
   /* ---------- hit testing ---------- */
   const hitNode = useCallback((w: Pt): SceneNode | null => {

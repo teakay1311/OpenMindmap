@@ -8,10 +8,11 @@
 
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { useApp } from '../lib/store'
+import { captureProjectRenameTarget, useApp, type ProjectRenameTarget } from '../lib/store'
 import { placeOverlay } from '../lib/scene/overlay'
 import { getTopic } from '../lib/core/tree'
 import { buildCatalogItems, copySelection, pasteFromClipboard, registerMenuUiActions, type CatalogItem } from '../lib/core/menuCatalog'
+import { recentProjects } from '../lib/storage/projects'
 import { isNativeMacOS, mountNativeBridge } from '../lib/native/bridge'
 import { IconBtn, Divider } from './ui-bits'
 import {
@@ -360,6 +361,7 @@ function AppMenu({ focusOnOpen, onClose }: { focusOnOpen: boolean; onClose: (res
   const ref = useRef<HTMLDivElement>(null)
   const doc = useApp((s) => s.doc)
   const registry = useApp((s) => s.registry)
+  const recent = recentProjects(registry)
   const gridOn = useApp((s) => s.gridOn)
   const snapOn = useApp((s) => s.snapOn)
   const minimapOn = useApp((s) => s.minimapOn)
@@ -433,7 +435,7 @@ function AppMenu({ focusOnOpen, onClose }: { focusOnOpen: boolean; onClose: (res
               </span>
               {item.recentToggle ? (
                 <span className="shrink-0 whitespace-nowrap rounded bg-[var(--panel-2-bg)] px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-[var(--text3)]">
-                  {registry.length} {recentOpen ? '▴' : '▾'}
+                  {recent.length} {recentOpen ? '▴' : '▾'}
                 </span>
               ) : item.hint ? (
                 <span className="shrink-0 whitespace-nowrap rounded bg-[var(--panel-2-bg)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--text3)]">
@@ -443,7 +445,7 @@ function AppMenu({ focusOnOpen, onClose }: { focusOnOpen: boolean; onClose: (res
             </button>
             {item.recentToggle && recentOpen && (
               <div className="my-1 ml-2 max-h-40 overflow-y-auto border-l border-[var(--border)] pl-2">
-                {registry.slice(0, 8).map((m) => (
+                {recent.slice(0, 8).map((m) => (
                   <button
                     key={m.id}
                     type="button"
@@ -454,7 +456,7 @@ function AppMenu({ focusOnOpen, onClose }: { focusOnOpen: boolean; onClose: (res
                     <span className="truncate">{m.name}</span>
                   </button>
                 ))}
-                {!registry.length && <div className="px-2 py-1 text-[11px] text-[var(--text3)]">Chưa có dự án nào</div>}
+                {!recent.length && <div className="px-2 py-1 text-[11px] text-[var(--text3)]">Chưa có dự án nào</div>}
               </div>
             )}
           </div>
@@ -491,13 +493,30 @@ function Sidebar({ width }: { width: number }) {
   const registry = useApp((s) => s.registry)
   const doc = useApp((s) => s.doc)
   const sidebar = useApp((s) => s.sidebar)
+  const transitionBusy = useApp((s) => s.transitionBusy)
   const [query, setQuery] = useState('')
-  const [renaming, setRenaming] = useState<string | null>(null)
-  const [ctx, setCtx] = useState<{ x: number; y: number; id: string } | null>(null)
+  const [renaming, setRenaming] = useState<(ProjectRenameTarget & { interrupted?: true }) | null>(null)
+  const renameInput = useRef<HTMLInputElement>(null)
+  const [ctx, setCtx] = useState<{ x: number; y: number; target: ProjectRenameTarget } | null>(null)
   const list = useMemo(() => {
     const q = query.trim().toLowerCase()
     return [...registry].sort((a, b) => (b.lastOpened > a.lastOpened ? 1 : -1)).filter((m) => !q || m.name.toLowerCase().includes(q))
   }, [registry, query])
+
+  useLayoutEffect(() => {
+    if (!renaming?.interrupted || transitionBusy) return
+    const frame = requestAnimationFrame(() => {
+      const st = useApp.getState()
+      const legacy = renaming.legacy
+      const input = renameInput.current
+      const focused = document.activeElement
+      if (legacy && input && (focused === document.body || focused === input)
+        && st.doc?.project_id === renaming.id && st.generation === legacy.generation + 1
+        && st.persistedRaw === legacy.raw) input.focus()
+      else setRenaming(current => current === renaming ? null : current)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [renaming, transitionBusy])
 
   if (width === 0) {
     return (
@@ -546,34 +565,33 @@ function Sidebar({ width }: { width: number }) {
                 data-project-transition onClick={() => useApp.getState().openProject(m.id)}
                 onKeyDown={e => {
                   if (e.target !== e.currentTarget) return
-                  if (e.key === 'F2') { e.preventDefault(); setRenaming(m.id) }
+                  if (e.key === 'F2') { e.preventDefault(); setRenaming(captureProjectRenameTarget(m)) }
                   else if (e.key === 'Enter') { e.preventDefault(); void useApp.getState().openProject(m.id) }
                 }}
-                onDoubleClick={() => setRenaming(m.id)}
-                onContextMenu={(e) => { e.preventDefault(); setCtx({ x: e.clientX, y: e.clientY, id: m.id }) }}
+                onDoubleClick={() => setRenaming(captureProjectRenameTarget(m))}
+                onContextMenu={(e) => { e.preventDefault(); setCtx({ x: e.clientX, y: e.clientY, target: captureProjectRenameTarget(m) }) }}
                 className={`group mb-1 flex cursor-pointer items-center justify-between rounded-lg px-2.5 py-2 text-[12.5px] transition-colors ${doc?.project_id === m.id ? 'bg-[var(--accentSoft)] font-medium text-[var(--accent)]' : 'text-[var(--text)] hover:bg-[var(--hover)]'}`}
                 title={`${m.name} · ${m.nodeCount} node · mở ${new Date(m.lastOpened).toLocaleString('vi-VN')}`}
               >
-                {renaming === m.id ? (
+                {renaming?.id === m.id ? (
                   <input
-                    autoFocus defaultValue={m.name}
+                    ref={renameInput} autoFocus defaultValue={m.name}
                     aria-label="Đổi tên dự án"
                     onClick={(e) => e.stopPropagation()}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') {
                         const v = (e.target as HTMLInputElement).value.trim()
-                        if (v) {
-                          if (doc?.project_id === m.id) useApp.getState().renameProject(v)
-                          else {
-                            const cur = registry.find((x) => x.id === m.id)
-                            if (cur) void useApp.getState().renameStoredProject(cur.id, v)
-                          }
-                        }
+                        if (v) void useApp.getState().renameStoredProject(renaming.id, v, renaming)
                         setRenaming(null)
                       }
                       if (e.key === 'Escape') setRenaming(null)
                     }}
-                    onBlur={() => setRenaming(null)}
+                    onBlur={e => {
+                      // The transition temporarily makes the sidebar inert while opening the legacy project.
+                      if (!e.relatedTarget && renaming.legacy && useApp.getState().transitionBusy) {
+                        setRenaming(current => current === renaming ? { ...renaming, interrupted: true } : current)
+                      } else setRenaming(null)
+                    }}
                     className="w-full rounded border border-[var(--accent)] bg-[var(--bg)] px-1.5 py-0.5 text-[12px]"
                   />
                 ) : (
@@ -585,7 +603,7 @@ function Sidebar({ width }: { width: number }) {
                       onClick={(e) => {
                         e.stopPropagation()
                         const r = e.currentTarget.getBoundingClientRect()
-                        setCtx({ x: e.clientX || r.right, y: e.clientY || r.bottom, id: m.id })
+                        setCtx({ x: e.clientX || r.right, y: e.clientY || r.bottom, target: captureProjectRenameTarget(m) })
                       }}
                       className="ml-1 flex h-5 w-5 shrink-0 items-center justify-center rounded text-[var(--text2)] opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus:opacity-100 focus-visible:opacity-100 hover:bg-[var(--border-strong)]"
                       title="Thao tác khác"
@@ -607,12 +625,12 @@ function Sidebar({ width }: { width: number }) {
         <ContextMenu
           x={ctx.x} y={ctx.y}
           items={[
-            { label: 'Đổi tên (F2/double-click)', onClick: () => setRenaming(ctx.id) },
-            { label: 'Nhân bản', onClick: () => useApp.getState().duplicateProject(ctx.id) },
-            { label: 'Lưu thành bản sao độc lập', disabled: doc?.project_id !== ctx.id, onClick: () => useApp.getState().resolveConflictSaveAs() },
+            { label: 'Đổi tên (F2/double-click)', onClick: () => setRenaming(ctx.target) },
+            { label: 'Nhân bản', onClick: () => useApp.getState().duplicateProject(ctx.target.id) },
+            { label: 'Lưu thành bản sao độc lập', disabled: doc?.project_id !== ctx.target.id, onClick: () => useApp.getState().resolveConflictSaveAs() },
             { sep: true, label: '' },
-            { label: 'Chuyển vào thùng rác', danger: true, onClick: () => useApp.getState().deleteProject(ctx.id) },
-            { label: 'Bỏ khỏi danh sách gần đây', onClick: () => useApp.getState().removeRecent(ctx.id) },
+            { label: 'Chuyển vào thùng rác', danger: true, onClick: () => useApp.getState().deleteProject(ctx.target.id) },
+            { label: 'Bỏ khỏi danh sách gần đây', onClick: () => useApp.getState().removeRecent(ctx.target.id) },
           ]}
           onClose={() => setCtx(null)}
         />

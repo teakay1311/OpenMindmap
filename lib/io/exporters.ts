@@ -426,22 +426,26 @@ export async function exportPDF(scene: Scene, opts: ExportOptions, padding: numb
   let pdf: jsPDF
   let pageW: number, pageH: number
   if (opts.pdfPaper === 'content') {
-    pageW = Math.max(contentWpt, 28)
-    pageH = Math.max(contentHpt, 28)
-    pdf = new jsPDF({ unit: 'pt', format: [pageW, pageH], orientation: contentWpt > contentHpt ? 'landscape' : 'portrait' })
+    const maxPagePoints = 14_400
+    const pageScale = Math.min(1, maxPagePoints / Math.max(contentWpt, contentHpt))
+    const width = Math.min(maxPagePoints, Math.max(contentWpt * pageScale, 28))
+    const height = Math.min(maxPagePoints, Math.max(contentHpt * pageScale, 28))
+    pdf = new jsPDF({ unit: 'pt', format: [width, height], orientation: width > height ? 'landscape' : 'portrait' })
   } else {
     const paper = opts.pdfPaper === 'a4' ? 'a4' : 'a3'
     pdf = new jsPDF({ unit: 'pt', format: paper, orientation: opts.pdfOrientation })
-    pageW = pdf.internal.pageSize.getWidth()
-    pageH = pdf.internal.pageSize.getHeight()
   }
+  pageW = pdf.internal.pageSize.getWidth()
+  pageH = pdf.internal.pageSize.getHeight()
 
   const paintPage = () => {
     pdf.setFillColor(bgColor)
     pdf.rect(0, 0, pageW, pageH, 'F')
   }
   if (opts.pdfPaper === 'content' || opts.pdfMode === 'onepage') {
-    const raster = await rasterizeSVG(svg, Math.min(scale, Math.sqrt((16 * 1024 * 1024) / (vb.w * vb.h)) * 1.2 || scale), bgColor)
+    const areaScale = Math.sqrt((16 * 1024 * 1024) / (vb.w * vb.h)) * 1.2 || scale
+    const edgeScale = opts.pdfPaper === 'content' ? (LIMITS.pngMaxEdge - 1) / Math.max(vb.w, vb.h) : scale
+    const raster = await rasterizeSVG(svg, Math.min(scale, areaScale, edgeScale), bgColor)
     const dataUrl = raster.toDataURL('image/jpeg', 0.92)
     const fit = Math.min(pageW / contentWpt, pageH / contentHpt)
     const w = contentWpt * fit, h = contentHpt * fit
